@@ -18,11 +18,11 @@ const { query } = require('../db');
 router.get('/:appId/tables', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query(
-      `SELECT id, table_name, entity_name FROM app_tables WHERE app_id = $1 ORDER BY COALESCE(entity_name, table_name)`,
+    const [rows] = await query(
+      `SELECT id, table_name, entity_name FROM app_tables WHERE app_id = ? ORDER BY COALESCE(entity_name, table_name)`,
       [appId]
     );
-    res.json({ tables: result.rows });
+    res.json({ tables: rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -32,11 +32,11 @@ router.get('/:appId/tables', async (req, res) => {
 router.get('/:appId/tables/:tableId/columns', async (req, res) => {
   try {
     const { tableId } = req.params;
-    const result = await query(
-      `SELECT id, column_name, business_name FROM app_columns WHERE table_id = $1 ORDER BY COALESCE(business_name, column_name)`,
+    const [rows] = await query(
+      `SELECT id, column_name, business_name FROM app_columns WHERE table_id = ? ORDER BY COALESCE(business_name, column_name)`,
       [tableId]
     );
-    res.json({ columns: result.rows });
+    res.json({ columns: rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -45,14 +45,14 @@ router.get('/:appId/tables/:tableId/columns', async (req, res) => {
 // ─── GET /api/synonyms/packs — List available domain packs with term counts ───
 router.get('/packs', async (req, res) => {
   try {
-    const result = await query(`
+    const [rows] = await query(`
       SELECT
         COALESCE(domain_pack, 'universal') as pack_name,
         COUNT(*) as term_count,
-        array_agg(DISTINCT category) as categories
+        GROUP_CONCAT(DISTINCT category) as categories
       FROM global_synonyms
       GROUP BY domain_pack
-      ORDER BY domain_pack NULLS LAST
+      ORDER BY domain_pack IS NULL DESC, domain_pack
     `);
 
     const packDescriptions = {
@@ -62,11 +62,11 @@ router.get('/packs', async (req, res) => {
       'erp-sap': 'SAP ECC 6.0 terminology — SD sales orders, FI general ledger, MM purchasing, CO controlling, HR payroll. Maps business vocabulary like "bookings", "spend", "revenue" to SAP table/column names (VBAK, EKKO, BSIS, etc.).',
     };
 
-    const packs = result.rows.map(r => ({
+    const packs = rows.map(r => ({
       name: r.pack_name,
       label: r.pack_name === 'universal' ? 'Universal ERP / Finance' : r.pack_name.charAt(0).toUpperCase() + r.pack_name.slice(1),
       termCount: parseInt(r.term_count),
-      categories: r.categories.filter(Boolean),
+      categories: (r.categories || '').split(',').filter(Boolean),
       description: packDescriptions[r.pack_name] || `${r.pack_name} domain synonym pack`,
     }));
 
@@ -90,22 +90,22 @@ router.get('/:appId', async (req, res) => {
       FROM app_synonyms s
       LEFT JOIN app_columns c ON s.column_id = c.id
       LEFT JOIN app_tables t ON s.table_id = t.id
-      WHERE s.app_id = $1
+      WHERE s.app_id = ?
     `;
     const params = [appId];
     let idx = 2;
 
-    if (status) { sql += ` AND s.status = $${idx++}`; params.push(status); }
-    if (source) { sql += ` AND s.source = $${idx++}`; params.push(source); }
-    if (tableId) { sql += ` AND s.table_id = $${idx++}`; params.push(tableId); }
-    if (columnId) { sql += ` AND s.column_id = $${idx++}`; params.push(columnId); }
+    if (status) { sql += ` AND s.status = ?`; params.push(status); }
+    if (source) { sql += ` AND s.source = ?`; params.push(source); }
+    if (tableId) { sql += ` AND s.table_id = ?`; params.push(tableId); }
+    if (columnId) { sql += ` AND s.column_id = ?`; params.push(columnId); }
 
     sql += ` ORDER BY s.created_at DESC`;
 
-    const result = await query(sql, params);
+    const [rows] = await query(sql, params);
 
     // Build summary
-    const synonyms = result.rows;
+    const synonyms = rows;
     const summary = {
       total: synonyms.length,
       active: synonyms.filter(s => s.status === 'active').length,
@@ -134,15 +134,14 @@ router.post('/:appId', async (req, res) => {
       return res.status(400).json({ error: 'term is required' });
     }
 
-    const result = await query(
+    await query(
       `INSERT INTO app_synonyms (app_id, column_id, table_id, term, source, confidence_score, status, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (app_id, column_id, term) DO UPDATE SET
-         source = EXCLUDED.source,
-         confidence_score = EXCLUDED.confidence_score,
-         status = EXCLUDED.status,
-         updated_at = NOW()
-       RETURNING *`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         source = VALUES(source),
+         confidence_score = VALUES(confidence_score),
+         status = VALUES(status),
+         updated_at = NOW()`,
       [
         appId,
         columnId || null,
@@ -155,7 +154,11 @@ router.post('/:appId', async (req, res) => {
       ]
     );
 
-    res.json({ synonym: result.rows[0] });
+    const [synRows] = await query(
+      'SELECT * FROM app_synonyms WHERE app_id = ? AND term = ? AND (column_id = ? OR (column_id IS NULL AND ? IS NULL)) ORDER BY id DESC LIMIT 1',
+      [appId, term.trim(), columnId || null, columnId || null]
+    );
+    res.json({ synonym: synRows[0] });
   } catch (err) {
     console.error('POST synonym error:', err.message);
     res.status(500).json({ error: err.message });
@@ -166,8 +169,8 @@ router.post('/:appId', async (req, res) => {
 router.delete('/:appId/all', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query('DELETE FROM app_synonyms WHERE app_id = $1', [appId]);
-    res.json({ deleted: result.rowCount, message: `Cleared all synonyms for app ${appId}` });
+    const [rows] = await query('DELETE FROM app_synonyms WHERE app_id = ?', [appId]);
+    res.json({ deleted: rows.affectedRows, message: `Cleared all synonyms for app ${appId}` });
   } catch (err) {
     console.error('DELETE all synonyms error:', err.message);
     res.status(500).json({ error: err.message });
@@ -184,18 +187,19 @@ router.put('/:appId/:id', async (req, res) => {
     const params = [];
     let idx = 1;
 
-    if (term !== undefined) { sets.push(`term = $${idx++}`); params.push(term); }
-    if (status !== undefined) { sets.push(`status = $${idx++}`); params.push(status); }
-    if (confidenceScore !== undefined) { sets.push(`confidence_score = $${idx++}`); params.push(confidenceScore); }
+    if (term !== undefined) { sets.push(`term = ?`); params.push(term); }
+    if (status !== undefined) { sets.push(`status = ?`); params.push(status); }
+    if (confidenceScore !== undefined) { sets.push(`confidence_score = ?`); params.push(confidenceScore); }
     sets.push(`updated_at = NOW()`);
 
     params.push(id);
-    const result = await query(
-      `UPDATE app_synonyms SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`,
+    await query(
+      `UPDATE app_synonyms SET ${sets.join(', ')} WHERE id = ?`,
       params
     );
 
-    res.json({ synonym: result.rows[0] });
+    const [synRows] = await query('SELECT * FROM app_synonyms WHERE id = ?', [id]);
+    res.json({ synonym: synRows[0] });
   } catch (err) {
     console.error('PUT synonym error:', err.message);
     res.status(500).json({ error: err.message });
@@ -206,7 +210,7 @@ router.put('/:appId/:id', async (req, res) => {
 router.delete('/:appId/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await query('DELETE FROM app_synonyms WHERE id = $1', [id]);
+    await query('DELETE FROM app_synonyms WHERE id = ?', [id]);
     res.json({ deleted: true });
   } catch (err) {
     console.error('DELETE synonym error:', err.message);
@@ -220,24 +224,24 @@ router.post('/:appId/generate', async (req, res) => {
     const { appId } = req.params;
 
     // Get columns that don't have synonyms yet
-    const cols = await query(`
+    const [cols] = await query(`
       SELECT c.id as column_id, c.column_name, c.business_name, c.data_type, c.description,
              t.id as table_id, t.table_name, t.entity_name
       FROM app_columns c
       JOIN app_tables t ON c.table_id = t.id
-      WHERE t.app_id = $1
-        AND c.id NOT IN (SELECT DISTINCT column_id FROM app_synonyms WHERE app_id = $1 AND column_id IS NOT NULL)
+      WHERE t.app_id = ?
+        AND c.id NOT IN (SELECT DISTINCT column_id FROM app_synonyms WHERE app_id = ? AND column_id IS NOT NULL)
       ORDER BY t.table_name, c.column_name
       LIMIT 500
     `, [appId]);
 
-    if (cols.rows.length === 0) {
+    if (cols.length === 0) {
       return res.json({ generated: 0, message: 'All columns already have synonyms' });
     }
 
     // Generate synonyms from business names and descriptions
     let generated = 0;
-    for (const col of cols.rows) {
+    for (const col of cols) {
       const synonymTerms = [];
 
       // Extract from business_name if different from column_name
@@ -288,9 +292,8 @@ router.post('/:appId/generate', async (req, res) => {
       for (const term of unique) {
         try {
           await query(
-            `INSERT INTO app_synonyms (app_id, column_id, table_id, term, source, confidence_score, status)
-             VALUES ($1, $2, $3, $4, 'ai_generated', 75, 'pending_review')
-             ON CONFLICT DO NOTHING`,
+            `INSERT IGNORE INTO app_synonyms (app_id, column_id, table_id, term, source, confidence_score, status)
+             VALUES (?, ?, ?, ?, 'ai_generated', 75, 'pending_review')`,
             [appId, col.column_id, col.table_id, term]
           );
           generated++;
@@ -321,30 +324,30 @@ router.post('/:appId/apply-global', async (req, res) => {
         if (pack === 'universal') {
           conditions.push('domain_pack IS NULL');
         } else {
-          conditions.push(`domain_pack = $${idx++}`);
+          conditions.push(`domain_pack = ?`);
           globalsParams.push(pack);
         }
       }
       globalsSql += ' WHERE ' + conditions.join(' OR ');
     }
-    globalsSql += ' ORDER BY domain_pack NULLS FIRST, term';
+    globalsSql += ' ORDER BY domain_pack IS NULL DESC, domain_pack, term';
 
-    const globals = await query(globalsSql, globalsParams);
-    if (globals.rows.length === 0) {
+    const [globals] = await query(globalsSql, globalsParams);
+    if (globals.length === 0) {
       return res.json({ applied: 0, message: 'No global ontology terms found for the selected packs.' });
     }
 
     // Get all columns for this app
-    const appCols = await query(`
+    const [appCols] = await query(`
       SELECT c.id as column_id, c.column_name, c.business_name, c.description,
              t.id as table_id, t.table_name, t.entity_name
       FROM app_columns c
       JOIN app_tables t ON c.table_id = t.id
-      WHERE t.app_id = $1
+      WHERE t.app_id = ?
     `, [appId]);
 
     let applied = 0;
-    for (const g of globals.rows) {
+    for (const g of globals) {
       const canonical = g.canonical_name.toLowerCase();
       const canonicalUnderscore = canonical.replace(/[\s-]+/g, '_');
       const canonicalNoSpace = canonical.replace(/[\s_-]+/g, '');
@@ -358,21 +361,20 @@ router.post('/:appId/apply-global', async (req, res) => {
       ]);
 
       // Check if canonical matches a table name (table-level synonym)
-      const allTableNames = new Set(appCols.rows.map(c => (c.table_name || '').toLowerCase()));
+      const allTableNames = new Set(appCols.map(c => (c.table_name || '').toLowerCase()));
       const isTableCanonical = allTableNames.has(canonicalUnderscore);
 
       if (isTableCanonical) {
         // Table-level match: insert ONE synonym per matching table (column_id = NULL)
         const matchingTableIds = new Set();
-        for (const col of appCols.rows) {
+        for (const col of appCols) {
           const tableName = (col.table_name || '').toLowerCase();
           if (tableName === canonicalUnderscore && !matchingTableIds.has(col.table_id)) {
             matchingTableIds.add(col.table_id);
             try {
               await query(
-                `INSERT INTO app_synonyms (app_id, column_id, table_id, term, source, confidence_score, status, global_synonym_id)
-                 VALUES ($1, NULL, $2, $3, $4, $5, 'active', $6)
-                 ON CONFLICT DO NOTHING`,
+                `INSERT IGNORE INTO app_synonyms (app_id, column_id, table_id, term, source, confidence_score, status, global_synonym_id)
+                 VALUES (?, NULL, ?, ?, ?, ?, 'active', ?)`,
                 [
                   appId,
                   col.table_id,
@@ -390,7 +392,7 @@ router.post('/:appId/apply-global', async (req, res) => {
       }
 
       // Column-level matching
-      const matched = appCols.rows.filter(col => {
+      const matched = appCols.filter(col => {
         const colName = (col.column_name || '').toLowerCase();
         const bizName = (col.business_name || '').toLowerCase();
         const colNoUnderscore = colName.replace(/_/g, '');
@@ -418,9 +420,8 @@ router.post('/:appId/apply-global', async (req, res) => {
       for (const col of finalMatched) {
         try {
           await query(
-            `INSERT INTO app_synonyms (app_id, column_id, table_id, term, source, confidence_score, status, global_synonym_id)
-             VALUES ($1, $2, $3, $4, $5, $6, 'active', $7)
-             ON CONFLICT DO NOTHING`,
+            `INSERT IGNORE INTO app_synonyms (app_id, column_id, table_id, term, source, confidence_score, status, global_synonym_id)
+             VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
             [
               appId,
               col.column_id,
@@ -668,9 +669,8 @@ router.post('/admin/seed-erp', async (req, res) => {
     for (const s of erpPack) {
       try {
         await query(
-          `INSERT INTO global_synonyms (term, canonical_name, category, domain_pack, description)
-           VALUES ($1, $2, $3, 'erp', $4)
-           ON CONFLICT DO NOTHING`,
+          `INSERT IGNORE INTO global_synonyms (term, canonical_name, category, domain_pack, description)
+           VALUES (?, ?, ?, 'erp', ?)`,
           [s.term, s.canonical_name, s.category, `ERP synonym: ${s.term} → ${s.canonical_name}`]
         );
         inserted++;
@@ -1109,9 +1109,8 @@ router.post('/admin/seed-sap', async (req, res) => {
     for (const s of sapPack) {
       try {
         await query(
-          `INSERT INTO global_synonyms (term, canonical_name, category, domain_pack, description)
-           VALUES ($1, $2, $3, 'erp-sap', $4)
-           ON CONFLICT DO NOTHING`,
+          `INSERT IGNORE INTO global_synonyms (term, canonical_name, category, domain_pack, description)
+           VALUES (?, ?, ?, 'erp-sap', ?)`,
           [s.term, s.canonical_name, s.category, `SAP synonym: ${s.term} → ${s.canonical_name}`]
         );
         inserted++;

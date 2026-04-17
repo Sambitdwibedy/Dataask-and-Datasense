@@ -166,15 +166,15 @@ async function extractText(buffer, mimetype, filename) {
 router.get('/:appId/documents', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query(
+    const [rows] = await query(
       `SELECT id, app_id, filename, file_type, file_size, description,
               LENGTH(extracted_text) as text_length, uploaded_at
        FROM context_documents
-       WHERE app_id = $1
+       WHERE app_id = ?
        ORDER BY uploaded_at DESC`,
       [appId]
     );
-    res.json({ documents: result.rows });
+    res.json({ documents: rows });
   } catch (err) {
     console.error('List context documents error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -185,14 +185,14 @@ router.get('/:appId/documents', async (req, res) => {
 router.get('/:appId/documents/:docId', async (req, res) => {
   try {
     const { appId, docId } = req.params;
-    const result = await query(
-      `SELECT * FROM context_documents WHERE id = $1 AND app_id = $2`,
+    const [rows] = await query(
+      `SELECT * FROM context_documents WHERE id = ? AND app_id = ?`,
       [docId, appId]
     );
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'Document not found' });
     }
-    res.json({ document: result.rows[0] });
+    res.json({ document: rows[0] });
   } catch (err) {
     console.error('Get context document error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -218,15 +218,15 @@ router.post('/:appId/upload', upload.single('file'), async (req, res) => {
     console.log(`Extracted ${textLength} characters from ${file.originalname}`);
 
     // Store in database
-    const result = await query(
+    const [result] = await query(
       `INSERT INTO context_documents (app_id, filename, file_type, file_size, extracted_text, description, uploaded_by, uploaded_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING id, filename, file_type, file_size, description, uploaded_at`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
       [appId, file.originalname, file.mimetype, file.size, extractedText, description, req.user?.id || null]
     );
 
+    const [docRows] = await query('SELECT id, app_id, filename, file_type, file_size, description, LENGTH(extracted_text) as text_length, uploaded_at FROM context_documents WHERE id = ?', [result.insertId]);
     res.status(201).json({
-      document: result.rows[0],
+      document: docRows[0],
       text_length: textLength,
       preview: extractedText ? extractedText.substring(0, 500) + (textLength > 500 ? '...' : '') : '',
     });
@@ -240,11 +240,11 @@ router.post('/:appId/upload', upload.single('file'), async (req, res) => {
 router.delete('/:appId/documents/:docId', async (req, res) => {
   try {
     const { appId, docId } = req.params;
-    const result = await query(
-      'DELETE FROM context_documents WHERE id = $1 AND app_id = $2 RETURNING id',
+    const [rows] = await query(
+      'DELETE FROM context_documents WHERE id = ? AND app_id = ?',
       [docId, appId]
     );
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'Document not found' });
     }
     res.json({ deleted: true });
@@ -258,19 +258,19 @@ router.delete('/:appId/documents/:docId', async (req, res) => {
 router.get('/:appId/combined', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query(
+    const [rows] = await query(
       `SELECT filename, extracted_text FROM context_documents
-       WHERE app_id = $1 AND extracted_text IS NOT NULL AND extracted_text != ''
+       WHERE app_id = ? AND extracted_text IS NOT NULL AND extracted_text != ''
        ORDER BY uploaded_at`,
       [appId]
     );
 
-    const sections = result.rows.map(doc =>
+    const sections = rows.map(doc =>
       `=== Source: ${doc.filename} ===\n${doc.extracted_text}`
     );
 
     res.json({
-      document_count: result.rows.length,
+      document_count: rows.length,
       combined_text: sections.join('\n\n'),
       total_characters: sections.join('\n\n').length,
     });
@@ -295,49 +295,50 @@ router.post('/:appId/re-enrich', async (req, res) => {
     }
 
     // Get context documents
-    const contextResult = await query(
+    const [contextRows] = await query(
       `SELECT filename, extracted_text FROM context_documents
-       WHERE app_id = $1 AND extracted_text IS NOT NULL AND extracted_text != ''
+       WHERE app_id = ? AND extracted_text IS NOT NULL AND extracted_text != ''
        ORDER BY uploaded_at`,
       [appId]
     );
 
-    if (contextResult.rows.length === 0) {
+    if (contextRows.length === 0) {
       return res.status(400).json({ error: 'No context documents uploaded. Upload reference materials first.' });
     }
 
-    const contextText = contextResult.rows
+    const contextText = contextRows
       .map(doc => `=== Source: ${doc.filename} ===\n${doc.extracted_text}`)
       .join('\n\n');
 
-    console.log(`[Re-Enrich] ${contextResult.rows.length} context docs loaded, total ${contextText.length} chars`);
-    contextResult.rows.forEach(doc => {
+    console.log(`[Re-Enrich] ${contextRows.length} context docs loaded, total ${contextText.length} chars`);
+    contextRows.forEach(doc => {
       console.log(`[Re-Enrich]   - ${doc.filename}: ${doc.extracted_text?.length || 0} chars`);
     });
 
     // Get the columns to re-enrich, grouped by table
-    const colResult = await query(
+    const placeholders = column_ids.map(() => '?').join(',');
+    const [colRows] = await query(
       `SELECT ac.id, ac.column_name, ac.data_type, ac.is_pk, ac.is_fk, ac.fk_reference,
               ac.business_name as current_business_name, ac.description as current_description,
               ac.confidence_score as current_confidence,
               at.id as table_id, at.table_name, at.entity_name
        FROM app_columns ac
        JOIN app_tables at ON ac.table_id = at.id
-       WHERE ac.id = ANY($1) AND at.app_id = $2`,
-      [column_ids, appId]
+       WHERE ac.id IN (${placeholders}) AND at.app_id = ?`,
+      [...column_ids, appId]
     );
 
-    if (colResult.rows.length === 0) {
+    if (colRows.length === 0) {
       return res.status(404).json({ error: 'No matching columns found' });
     }
 
     // Get app info
-    const appResult = await query('SELECT * FROM applications WHERE id = $1', [appId]);
-    const app = appResult.rows[0];
+    const [appRows] = await query('SELECT * FROM applications WHERE id = ?', [appId]);
+    const app = appRows[0];
 
     // Group columns by table
     const byTable = {};
-    colResult.rows.forEach(col => {
+    colRows.forEach(col => {
       if (!byTable[col.table_id]) {
         byTable[col.table_id] = { table_name: col.table_name, entity_name: col.entity_name, columns: [] };
       }
@@ -385,10 +386,10 @@ router.post('/:appId/re-enrich', async (req, res) => {
 
         await query(
           `UPDATE app_columns
-           SET business_name = $1, description = $2, confidence_score = $3,
-               value_mapping = $4, enrichment_status = 'ai_enriched',
+           SET business_name = ?, description = ?, confidence_score = ?,
+               value_mapping = ?, enrichment_status = 'ai_enriched',
                enriched_by = 'ai+context', enriched_at = NOW()
-           WHERE id = $5`,
+           WHERE id = ?`,
           [
             enrichedCol.business_name || originalCol.current_business_name,
             enrichedCol.description || originalCol.current_description,
@@ -414,7 +415,7 @@ router.post('/:appId/re-enrich', async (req, res) => {
       re_enriched: results.length,
       columns: results,
       token_usage: totalTokens,
-      context_documents_used: contextResult.rows.length,
+      context_documents_used: contextRows.length,
     });
   } catch (err) {
     console.error('Re-enrich error:', err);
@@ -434,53 +435,53 @@ router.post('/:appId/merge', async (req, res) => {
     const confidenceThreshold = parseFloat(req.body.confidence_threshold) || 0.50;
 
     // 1. Load context documents
-    const contextResult = await query(
+    const [contextRows] = await query(
       `SELECT id, filename, extracted_text FROM context_documents
-       WHERE app_id = $1 AND extracted_text IS NOT NULL AND extracted_text != ''
+       WHERE app_id = ? AND extracted_text IS NOT NULL AND extracted_text != ''
        ORDER BY uploaded_at`,
       [appId]
     );
 
-    if (contextResult.rows.length === 0) {
+    if (contextRows.length === 0) {
       return res.status(400).json({ error: 'No context documents uploaded. Upload reference materials first.' });
     }
 
-    const contextText = contextResult.rows
+    const contextText = contextRows
       .map(doc => `=== Source: ${doc.filename} ===\n${doc.extracted_text}`)
       .join('\n\n');
 
-    console.log(`[Merge] ${contextResult.rows.length} context docs, total ${contextText.length} chars`);
+    console.log(`[Merge] ${contextRows.length} context docs, total ${contextText.length} chars`);
 
     // 2. Load all tables and columns for this app (focus on low-confidence ones)
-    const tablesResult = await query(
-      `SELECT id, table_name, entity_name, description FROM app_tables WHERE app_id = $1 ORDER BY table_name`,
+    const [tablesRows] = await query(
+      `SELECT id, table_name, entity_name, description FROM app_tables WHERE app_id = ? ORDER BY table_name`,
       [appId]
     );
 
-    const colsResult = await query(
+    const [colsRows] = await query(
       `SELECT ac.id, ac.column_name, ac.data_type, ac.business_name, ac.description,
               ac.confidence_score, ac.value_mapping, ac.enrichment_status,
               at.table_name, at.entity_name
        FROM app_columns ac
        JOIN app_tables at ON ac.table_id = at.id
-       WHERE at.app_id = $1
+       WHERE at.app_id = ?
        ORDER BY at.table_name, ac.column_name`,
       [appId]
     );
 
     // 3. Identify columns that need improvement
-    const lowConfCols = colsResult.rows.filter(c =>
+    const lowConfCols = colsRows.filter(c =>
       parseFloat(c.confidence_score || 0) < confidenceThreshold ||
       !c.description || c.description.trim() === '' ||
       !c.business_name || c.business_name.trim() === ''
     );
 
-    console.log(`[Merge] ${colsResult.rows.length} total columns, ${lowConfCols.length} below threshold (${confidenceThreshold})`);
+    console.log(`[Merge] ${colsRows.length} total columns, ${lowConfCols.length} below threshold (${confidenceThreshold})`);
 
     if (lowConfCols.length === 0) {
       return res.json({
         message: 'All columns are already well-enriched. No merge needed.',
-        total_columns: colsResult.rows.length,
+        total_columns: colsRows.length,
         low_confidence_columns: 0,
         merged: 0,
       });
@@ -488,8 +489,8 @@ router.post('/:appId/merge', async (req, res) => {
 
     // 4. Build schema summary for the LLM
     const schemaLines = [];
-    for (const table of tablesResult.rows) {
-      const tableCols = colsResult.rows.filter(c => c.table_name === table.table_name);
+    for (const table of tablesRows) {
+      const tableCols = colsRows.filter(c => c.table_name === table.table_name);
       schemaLines.push(`TABLE: ${table.table_name}`);
       for (const col of tableCols) {
         const conf = parseFloat(col.confidence_score || 0);
@@ -563,7 +564,7 @@ Return ONLY the JSON array, no explanation or markdown. If no columns can be imp
                            ((tokenUsage.output_tokens || 0) * 15 / 1000000);
       await query(
         `INSERT INTO token_usage (app_id, stage, table_name, input_tokens, output_tokens, total_tokens, model, cost_estimate)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [appId, 'context_merge', null, tokenUsage.input_tokens || 0, tokenUsage.output_tokens || 0,
          (tokenUsage.input_tokens || 0) + (tokenUsage.output_tokens || 0), 'claude-sonnet-4-20250514', costEstimate]
       );
@@ -597,7 +598,7 @@ Return ONLY the JSON array, no explanation or markdown. If no columns can be imp
       if (!ext.table_name || !ext.column_name) continue;
 
       // Find the matching column
-      const col = colsResult.rows.find(c =>
+      const col = colsRows.find(c =>
         c.table_name.toLowerCase() === ext.table_name.toLowerCase() &&
         c.column_name.toLowerCase() === ext.column_name.toLowerCase()
       );
@@ -641,11 +642,11 @@ Return ONLY the JSON array, no explanation or markdown. If no columns can be imp
       // Update the column
       await query(
         `UPDATE app_columns
-         SET business_name = $1, description = $2, confidence_score = $3,
-             value_mapping = COALESCE($4, value_mapping),
+         SET business_name = ?, description = ?, confidence_score = ?,
+             value_mapping = COALESCE(?, value_mapping),
              enrichment_status = 'ai_enriched', enriched_by = 'ai+context_merge',
              enriched_at = NOW()
-         WHERE id = $5`,
+         WHERE id = ?`,
         [newBizName, newDesc, newConf, newValueMapping, col.id]
       );
 
@@ -666,12 +667,12 @@ Return ONLY the JSON array, no explanation or markdown. If no columns can be imp
     console.log(`[Merge] Complete: ${mergeResults.length} columns updated out of ${extractions.length} extracted`);
 
     res.json({
-      total_columns: colsResult.rows.length,
+      total_columns: colsRows.length,
       low_confidence_columns: lowConfCols.length,
       extracted: extractions.length,
       merged: mergeResults.length,
       columns: mergeResults,
-      context_documents_used: contextResult.rows.length,
+      context_documents_used: contextRows.length,
       token_usage: {
         input_tokens: tokenUsage.input_tokens || 0,
         output_tokens: tokenUsage.output_tokens || 0,

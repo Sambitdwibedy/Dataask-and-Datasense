@@ -6,7 +6,7 @@ const router = express.Router();
 // GET /api/consumption/summary - overall token usage summary
 router.get('/summary', async (req, res) => {
   try {
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         COALESCE(SUM(input_tokens), 0) as total_input_tokens,
         COALESCE(SUM(output_tokens), 0) as total_output_tokens,
@@ -15,7 +15,7 @@ router.get('/summary', async (req, res) => {
         COUNT(*) as total_calls
       FROM token_usage`
     );
-    res.json(result.rows[0]);
+    res.json(rows[0]);
   } catch (err) {
     console.error('Consumption summary error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -25,7 +25,7 @@ router.get('/summary', async (req, res) => {
 // GET /api/consumption/by-app - token usage grouped by application
 router.get('/by-app', async (req, res) => {
   try {
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         a.id as app_id,
         a.name as app_name,
@@ -40,7 +40,7 @@ router.get('/by-app', async (req, res) => {
       GROUP BY a.id, a.name, a.type
       ORDER BY total_tokens DESC`
     );
-    res.json({ apps: result.rows });
+    res.json({ apps: rows });
   } catch (err) {
     console.error('Consumption by-app error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -50,7 +50,7 @@ router.get('/by-app', async (req, res) => {
 // GET /api/consumption/by-stage - token usage grouped by pipeline stage
 router.get('/by-stage', async (req, res) => {
   try {
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         stage,
         COALESCE(SUM(input_tokens), 0) as input_tokens,
@@ -63,7 +63,7 @@ router.get('/by-stage', async (req, res) => {
       GROUP BY stage
       ORDER BY total_tokens DESC`
     );
-    res.json({ stages: result.rows });
+    res.json({ stages: rows });
   } catch (err) {
     console.error('Consumption by-stage error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -74,7 +74,7 @@ router.get('/by-stage', async (req, res) => {
 router.get('/by-table/:appId', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         table_name,
         stage,
@@ -85,11 +85,11 @@ router.get('/by-table/:appId', async (req, res) => {
         model,
         created_at
       FROM token_usage
-      WHERE app_id = $1
+      WHERE app_id = ?
       ORDER BY created_at DESC`,
       [appId]
     );
-    res.json({ usage: result.rows });
+    res.json({ usage: rows });
   } catch (err) {
     console.error('Consumption by-table error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -100,7 +100,7 @@ router.get('/by-table/:appId', async (req, res) => {
 router.get('/by-run/:runId', async (req, res) => {
   try {
     const { runId } = req.params;
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         table_name,
         stage,
@@ -111,11 +111,11 @@ router.get('/by-run/:runId', async (req, res) => {
         model,
         created_at
       FROM token_usage
-      WHERE pipeline_run_id = $1
+      WHERE pipeline_run_id = ?
       ORDER BY created_at`,
       [runId]
     );
-    res.json({ usage: result.rows });
+    res.json({ usage: rows });
   } catch (err) {
     console.error('Consumption by-run error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -126,7 +126,7 @@ router.get('/by-run/:runId', async (req, res) => {
 router.get('/runs/:appId', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         pr.id as run_id,
         pr.status,
@@ -139,13 +139,13 @@ router.get('/runs/:appId', async (req, res) => {
         COUNT(tu.id) as api_calls
       FROM pipeline_runs pr
       LEFT JOIN token_usage tu ON pr.id = tu.pipeline_run_id
-      WHERE pr.app_id = $1
+      WHERE pr.app_id = ?
       GROUP BY pr.id, pr.status, pr.started_at, pr.completed_at
       ORDER BY pr.started_at DESC
       LIMIT 20`,
       [appId]
     );
-    res.json({ runs: result.rows });
+    res.json({ runs: rows });
   } catch (err) {
     console.error('Consumption runs error:', err);
     res.status(500).json({ error: 'Internal server error' });

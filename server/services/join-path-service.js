@@ -20,21 +20,21 @@ const { query } = require('../db');
  * The graph is bidirectional — if A→B exists, both A and B get edges.
  */
 async function buildAdjacencyGraph(appId) {
-  const result = await query(
+  const [rows] = await query(
     `SELECT ar.from_table_id, ar.from_column, ar.to_table_id, ar.to_column,
             ar.rel_type, ar.cardinality,
             ft.table_name AS from_table_name, tt.table_name AS to_table_name
      FROM app_relationships ar
      JOIN app_tables ft ON ar.from_table_id = ft.id
      JOIN app_tables tt ON ar.to_table_id = tt.id
-     WHERE ar.app_id = $1`,
+     WHERE ar.app_id = ?`,
     [appId]
   );
 
   const graph = new Map();
   const tableNames = new Map(); // table_id → table_name
 
-  for (const rel of result.rows) {
+  for (const rel of rows) {
     tableNames.set(rel.from_table_id, rel.from_table_name);
     tableNames.set(rel.to_table_id, rel.to_table_name);
 

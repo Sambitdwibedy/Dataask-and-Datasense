@@ -11,7 +11,7 @@ const audioUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-// Cost estimates: Sonnet input=$3/MTok, output=$15/MTok
+// Cost estimates: Sonnet input=?/MTok, output=?/MTok
 const COST_PER_INPUT_TOKEN = 3 / 1000000;
 const COST_PER_OUTPUT_TOKEN = 15 / 1000000;
 
@@ -59,22 +59,24 @@ async function buildColumnBusinessNames(appId, columns, sql) {
       const sqlTableMatches = sql.match(/"([A-Z][A-Z0-9_]+)"/g) || [];
       const sqlTableNames = [...new Set(sqlTableMatches.map(m => m.replace(/"/g, '')))];
 
+      const colPlaceholders = colNames.map(() => '?').join(', ');
+      let queryParams = [appId, ...colNames];
       let tableFilter = '';
-      let queryParams = [appId, colNames];
       if (sqlTableNames.length > 0) {
-        tableFilter = ' AND UPPER(at.table_name) = ANY($3::text[])';
-        queryParams.push(sqlTableNames.map(t => t.toUpperCase()));
+        const tblPlaceholders = sqlTableNames.map(() => '?').join(', ');
+        tableFilter = ` AND UPPER(at.table_name) IN (${tblPlaceholders})`;
+        queryParams.push(...sqlTableNames.map(t => t.toUpperCase()));
       }
 
-      const bizNames = await query(
+      const [bizNames] = await query(
         `SELECT ac.column_name, ac.business_name FROM app_columns ac
          JOIN app_tables at ON ac.table_id = at.id
-         WHERE at.app_id = $1 AND LOWER(ac.column_name) = ANY($2::text[])
+         WHERE at.app_id = ? AND LOWER(ac.column_name) IN (${colPlaceholders})
          AND ac.business_name IS NOT NULL AND ac.business_name != ''${tableFilter}`,
         queryParams
       );
 
-      for (const row of bizNames.rows) {
+      for (const row of bizNames) {
         const key = row.column_name.toLowerCase();
         if (!columnBusinessNames[key]) {
           columnBusinessNames[key] = row.business_name;
@@ -222,17 +224,17 @@ function extractSQL(rawText) {
 // e.g., WHERE "type" = 'vydaj' → WHERE "type" = 'VYDAJ'
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadValueDictionaries(appId) {
-  const result = await query(
+  const [rows] = await query(
     `SELECT ac.column_name, ac.value_mapping, at.table_name
      FROM app_columns ac
      JOIN app_tables at ON ac.table_id = at.id
-     WHERE at.app_id = $1 AND ac.value_mapping IS NOT NULL`,
+     WHERE at.app_id = ? AND ac.value_mapping IS NOT NULL`,
     [appId]
   );
 
   // Build lookup: { "table.column": { "lowercase_value": "exact_value", ... } }
   const dictionaries = {};
-  for (const row of result.rows) {
+  for (const row of rows) {
     try {
       const vm = typeof row.value_mapping === 'string' ? JSON.parse(row.value_mapping) : row.value_mapping;
       if (vm && typeof vm === 'object' && Object.keys(vm).length > 0) {
@@ -264,7 +266,7 @@ function addCollateNocase(sql) {
   if (!sql) return sql;
   // Match: comparison_operator followed by a single-quoted string, NOT already followed by COLLATE
   // Handles: = 'value', != 'value', <> 'value', = 'value with spaces'
-  return sql.replace(/(=\s*'[^']*')(?!\s*COLLATE)/gi, '$1 COLLATE NOCASE');
+  return sql.replace(/(=\s*'[^']*')(?!\s*COLLATE)/gi, '? COLLATE NOCASE');
 }
 
 /**
@@ -284,7 +286,7 @@ function fixApostropheCollate(sql) {
   for (let i = 0; i < maxIterations; i++) {
     const next = result.replace(
       /'([^']*)'\s*COLLATE\s+NOCASE's\s*([^']*)'/g,
-      "'$1''s $2' COLLATE NOCASE"
+      "'?''s ?' COLLATE NOCASE"
     );
     if (next === result) break;
     result = next;
@@ -329,7 +331,7 @@ function applyCaseFix(sql, valueDictionaries) {
 
   // Match patterns: "column_name" = 'value' or "column_name" IN ('val1', 'val2')
   // Also handles: "column_name" LIKE 'value%', "column_name" != 'value'
-  const stringLiteralPattern = /"(\w+)"\s*(?:=|!=|<>|LIKE|ILIKE|IN\s*\()\s*'([^']+)'/gi;
+  const stringLiteralPattern = /"(\w+)"\s*(?:=|!=|<>|LIKE|LIKE|IN\s*\()\s*'([^']+)'/gi;
 
   let match;
   while ((match = stringLiteralPattern.exec(sql)) !== null) {
@@ -411,20 +413,20 @@ async function getFewShotExamples(appId, question, maxExamples = 3) {
     }
 
     // Source 1: User-verified queries from test_queries (highest priority)
-    const verifiedResult = await query(
+    const [verifiedRows] = await query(
       `SELECT nl_query, generated_sql, execution_result
        FROM test_queries
-       WHERE app_id = $1 AND feedback = 'thumbs_up'
+       WHERE app_id = ? AND feedback = 'thumbs_up'
        ORDER BY created_at DESC
        LIMIT 20`,
       [appId]
     );
 
     // Source 2: Seeded query patterns from query_patterns (QPD)
-    const patternsResult = await query(
+    const [patternsRows] = await query(
       `SELECT nl_template AS nl_query, sql_template AS generated_sql, tables_used, confidence
        FROM query_patterns
-       WHERE app_id = $1 AND status = 'active' AND sql_template IS NOT NULL
+       WHERE app_id = ? AND status = 'active' AND sql_template IS NOT NULL
        ORDER BY confidence DESC, created_at DESC
        LIMIT 50`,
       [appId]
@@ -434,7 +436,7 @@ async function getFewShotExamples(appId, question, maxExamples = 3) {
     const allCandidates = [];
 
     // Verified queries get a 2x boost
-    for (const row of verifiedResult.rows) {
+    for (const row of verifiedRows) {
       let wasSuccessful = true;
       try {
         const execResult = typeof row.execution_result === 'string'
@@ -451,7 +453,7 @@ async function getFewShotExamples(appId, question, maxExamples = 3) {
     }
 
     // Seeded patterns (from BIRD QPD or builder-generated)
-    for (const row of patternsResult.rows) {
+    for (const row of patternsRows) {
       const overlap = scoreRelevance(row.nl_query);
       allCandidates.push({
         nl_query: row.nl_query,
@@ -494,20 +496,20 @@ async function getFewShotExamples(appId, question, maxExamples = 3) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function getContextDocumentSection(appId, maxChars = 8000) {
   try {
-    const result = await query(
+    const [rows] = await query(
       `SELECT filename, extracted_text FROM context_documents
-       WHERE app_id = $1 AND extracted_text IS NOT NULL AND extracted_text != ''
+       WHERE app_id = ? AND extracted_text IS NOT NULL AND extracted_text != ''
        ORDER BY uploaded_at`,
       [appId]
     );
 
-    if (result.rows.length === 0) return '';
+    if (rows.length === 0) return '';
 
     // Build context section, respecting token budget
     const sections = [];
     let totalChars = 0;
 
-    for (const doc of result.rows) {
+    for (const doc of rows) {
       const text = (doc.extracted_text || '').trim();
       if (!text) continue;
 
@@ -571,11 +573,11 @@ const COLUMN_LINK_THRESHOLD = 20; // Tables with more columns than this get colu
 async function schemaLink(appId, question, tableLinkThreshold = null) {
   const threshold = tableLinkThreshold || SCHEMA_LINK_THRESHOLD;
   // Get table count
-  const tableCountResult = await query(
-    'SELECT COUNT(*) as cnt FROM app_tables WHERE app_id = $1',
+  const [tableCountRows] = await query(
+    'SELECT COUNT(*) as cnt FROM app_tables WHERE app_id = ?',
     [appId]
   );
-  const tableCount = parseInt(tableCountResult.rows[0].cnt);
+  const tableCount = parseInt(tableCountRows[0].cnt);
 
   // If small schema, no linking needed — return null to use full context
   if (tableCount <= threshold) return null;
@@ -589,7 +591,7 @@ async function schemaLink(appId, question, tableLinkThreshold = null) {
               STRING_AGG(ac.column_name || ' ' || COALESCE(ac.business_name, '') || ' ' || COALESCE(ac.description, ''), ' ') as col_text
        FROM app_tables at
        LEFT JOIN app_columns ac ON at.id = ac.table_id
-       WHERE at.app_id = $1
+       WHERE at.app_id = ?
        GROUP BY at.id, at.table_name, at.entity_name, at.description, at.row_count`,
       [appId]
     ),
@@ -598,7 +600,7 @@ async function schemaLink(appId, question, tableLinkThreshold = null) {
     // making this a better tiebreaker than row count (which favors detail tables).
     query(
       `SELECT to_table_id, COUNT(*) as incoming_fk_count
-       FROM app_relationships WHERE app_id = $1
+       FROM app_relationships WHERE app_id = ?
        GROUP BY to_table_id`,
       [appId]
     ),
@@ -609,7 +611,7 @@ async function schemaLink(appId, question, tableLinkThreshold = null) {
 
   // Build centrality lookup
   const centralityMap = {};
-  for (const row of fkCounts.rows) {
+  for (const row of fkCounts) {
     centralityMap[row.to_table_id] = parseInt(row.incoming_fk_count) || 0;
   }
 
@@ -627,7 +629,7 @@ async function schemaLink(appId, question, tableLinkThreshold = null) {
   const questionLower = question.toLowerCase();
 
   // Score each table based on keyword overlap with metadata
-  const scored = allTables.rows.map(t => {
+  const scored = allTables.map(t => {
     const tableName = (t.table_name || '').toLowerCase();
     const entityName = (t.entity_name || '').toLowerCase();
     const searchText = [
@@ -714,14 +716,15 @@ async function schemaLink(appId, question, tableLinkThreshold = null) {
   } catch (e) {
     console.warn('  BFS join expansion failed (falling back to 1-hop):', e.message);
     // Fallback: old 1-hop expansion
-    const relResult = await query(
+    const relPlaceholders = selectedIds.map(() => '?').join(', ');
+    const [relRows] = await query(
       `SELECT DISTINCT
-         CASE WHEN from_table_id = ANY($1::int[]) THEN to_table_id ELSE from_table_id END as connected_id
+         CASE WHEN from_table_id IN (${relPlaceholders}) THEN to_table_id ELSE from_table_id END as connected_id
        FROM app_relationships
-       WHERE app_id = $2 AND (from_table_id = ANY($1::int[]) OR to_table_id = ANY($1::int[]))`,
-      [selectedIds, appId]
+       WHERE app_id = ? AND (from_table_id IN (${relPlaceholders}) OR to_table_id IN (${relPlaceholders}))`,
+      [...selectedIds, appId, ...selectedIds, ...selectedIds]
     );
-    for (const row of relResult.rows) {
+    for (const row of relRows) {
       if (!selectedIds.includes(row.connected_id)) {
         selectedIds.push(row.connected_id);
       }
@@ -831,16 +834,17 @@ function columnLink(question, columns, tableName, colLinkThreshold = null) {
 async function buildBOKGContext(appId, linkedTableIds = null, question = null, colLinkThreshold = null) {
   // Get tables with entity metadata (optionally filtered by schema linking)
   let tablesQuery = `SELECT id, table_name, entity_name, description, entity_metadata, row_count
-     FROM app_tables WHERE app_id = $1`;
+     FROM app_tables WHERE app_id = ?`;
   const tablesParams = [appId];
 
   if (linkedTableIds && linkedTableIds.length > 0) {
-    tablesQuery += ` AND id = ANY($2::int[])`;
-    tablesParams.push(linkedTableIds);
+    const tblIdPlaceholders = linkedTableIds.map(() => '?').join(', ');
+    tablesQuery += ` AND id IN (${tblIdPlaceholders})`;
+    tablesParams.push(...linkedTableIds);
   }
   tablesQuery += ` ORDER BY table_name`;
 
-  const tablesResult = await query(tablesQuery, tablesParams);
+  const [tablesRows] = await query(tablesQuery, tablesParams);
 
   // Get enriched columns (for selected tables only if schema-linked)
   let colsQuery = `SELECT ac.column_name, ac.data_type, ac.is_pk, ac.is_fk, ac.fk_reference,
@@ -848,31 +852,32 @@ async function buildBOKGContext(appId, linkedTableIds = null, question = null, c
             at.table_name
      FROM app_columns ac
      JOIN app_tables at ON ac.table_id = at.id
-     WHERE at.app_id = $1`;
+     WHERE at.app_id = ?`;
   const colsParams = [appId];
 
   if (linkedTableIds && linkedTableIds.length > 0) {
-    colsQuery += ` AND at.id = ANY($2::int[])`;
-    colsParams.push(linkedTableIds);
+    const colIdPlaceholders = linkedTableIds.map(() => '?').join(', ');
+    colsQuery += ` AND at.id IN (${colIdPlaceholders})`;
+    colsParams.push(...linkedTableIds);
   }
   colsQuery += ` ORDER BY at.table_name, ac.column_name`;
 
-  const colsResult = await query(colsQuery, colsParams);
+  const [colsRows] = await query(colsQuery, colsParams);
 
   // Get relationships (include all for completeness — they're small)
-  const relsResult = await query(
+  const [relsRows] = await query(
     `SELECT ft.table_name as from_table, ar.from_column,
             tt.table_name as to_table, ar.to_column, ar.rel_type, ar.cardinality
      FROM app_relationships ar
      JOIN app_tables ft ON ar.from_table_id = ft.id
      JOIN app_tables tt ON ar.to_table_id = tt.id
-     WHERE ar.app_id = $1`,
+     WHERE ar.app_id = ?`,
     [appId]
   );
 
   // Build relationship lookup: table.column → target_table.target_column
   const relLookup = {};
-  for (const rel of relsResult.rows) {
+  for (const rel of relsRows) {
     relLookup[`${rel.from_table}.${rel.from_column}`] = `${rel.to_table}.${rel.to_column}`;
   }
 
@@ -882,9 +887,9 @@ async function buildBOKGContext(appId, linkedTableIds = null, question = null, c
   sections.push('DATABASE SCHEMA AND BUSINESS CONTEXT:');
   sections.push('');
 
-  for (const table of tablesResult.rows) {
+  for (const table of tablesRows) {
     const meta = table.entity_metadata || {};
-    const tableCols = colsResult.rows.filter(c => c.table_name === table.table_name);
+    const tableCols = colsRows.filter(c => c.table_name === table.table_name);
 
     // Column-level filtering: for wide tables, only include relevant columns
     const selectedCols = question ? columnLink(question, tableCols, table.table_name, colLinkThreshold) : null;
@@ -950,10 +955,10 @@ async function buildBOKGContext(appId, linkedTableIds = null, question = null, c
   }
 
   // Add relationships as explicit join paths
-  if (relsResult.rows.length > 0) {
+  if (relsRows.length > 0) {
     // Filter to only relationships involving selected tables
-    const selectedTableNames = new Set(tablesResult.rows.map(t => t.table_name));
-    const relevantRels = relsResult.rows.filter(
+    const selectedTableNames = new Set(tablesRows.map(t => t.table_name));
+    const relevantRels = relsRows.filter(
       r => selectedTableNames.has(r.from_table) || selectedTableNames.has(r.to_table)
     );
 
@@ -969,21 +974,21 @@ async function buildBOKGContext(appId, linkedTableIds = null, question = null, c
 
   // Add SYNONYMS section — helps LLM understand business language → column/table mapping
   try {
-    const synsResult = await query(
+    const [synsRows] = await query(
       `SELECT s.term, ac.column_name, at.table_name, ac.business_name, s.column_id
        FROM app_synonyms s
        LEFT JOIN app_columns ac ON s.column_id = ac.id
        JOIN app_tables at ON s.table_id = at.id
-       WHERE s.app_id = $1 AND s.status = 'active'
+       WHERE s.app_id = ? AND s.status = 'active'
        ORDER BY at.table_name, COALESCE(ac.column_name, ''), s.term`,
       [appId]
     );
 
-    if (synsResult.rows.length > 0) {
+    if (synsRows.length > 0) {
       // Separate table-level and column-level synonyms
       const synGroups = {};
       const tableSynGroups = {};
-      for (const s of synsResult.rows) {
+      for (const s of synsRows) {
         if (s.column_id) {
           // Column-level synonym
           const key = `"${s.table_name}"."${s.column_name}"`;
@@ -1003,7 +1008,7 @@ async function buildBOKGContext(appId, linkedTableIds = null, question = null, c
       // Cross-reference with computed measures so the LLM sees the formula inline
       if (Object.keys(tableSynGroups).length > 0) {
         const tableMeasureLookup = {};
-        for (const table of tablesResult.rows) {
+        for (const table of tablesRows) {
           const meta = table.entity_metadata || {};
           if (meta.computed_measures && meta.computed_measures.length > 0) {
             tableMeasureLookup[`"${table.table_name}"`] = meta.computed_measures;
@@ -1048,7 +1053,7 @@ async function buildBOKGContext(appId, linkedTableIds = null, question = null, c
   const displayKeyRules = [];
   const tableColsByRole = {};
 
-  for (const col of colsResult.rows) {
+  for (const col of colsRows) {
     if (!tableColsByRole[col.table_name]) tableColsByRole[col.table_name] = {};
     if (col.column_role) {
       if (!tableColsByRole[col.table_name][col.column_role]) {
@@ -1096,7 +1101,7 @@ async function buildBOKGContext(appId, linkedTableIds = null, question = null, c
   // This is critical: users ask "how much" or "dollar amount" but the answer requires
   // multiplying price × quantity across a JOIN. Without this, the LLM falls back to COUNT(*).
   const computedMeasureLines = [];
-  for (const table of tablesResult.rows) {
+  for (const table of tablesRows) {
     const meta = table.entity_metadata || {};
     if (meta.computed_measures && meta.computed_measures.length > 0) {
       for (const cm of meta.computed_measures) {
@@ -1181,7 +1186,7 @@ const APP_SQL_HINTS = {
   // BIRD benchmark databases (financial, Czech banking data)
   bird: `
 - For Czech coded values: VYDAJ=withdrawal/debit, PRIJEM=credit, VYBER=cash withdrawal, PREVOD=remittance/bank transfer
-- DATA DATE RANGE: The data spans 1993-1998 but NOT every table has data for every year. Different tables have different max years (e.g., accounts go through 1997, transactions through 1998). When the user says "last year", "this year", or "recent", do NOT hardcode a specific year. Instead, use a subquery to find the max year in the PRIMARY table being queried: e.g., WHERE EXTRACT(YEAR FROM "date"::date) = (SELECT MAX(EXTRACT(YEAR FROM "date"::date)) FROM "account"). This ensures correct results regardless of which table's date range applies. NEVER use the current calendar year (2025/2026) — the data is historical.`,
+- DATA DATE RANGE: The data spans 1993-1998 but NOT every table has data for every year. Different tables have different max years (e.g., accounts go through 1997, transactions through 1998). When the user says "last year", "this year", or "recent", do NOT hardcode a specific year. Instead, use a subquery to find the max year in the PRIMARY table being queried: e.g., WHERE EXTRACT(YEAR FROM "date") = (SELECT MAX(EXTRACT(YEAR FROM "date")) FROM "account"). This ensures correct results regardless of which table's date range applies. NEVER use the current calendar year (2025/2026) — the data is historical.`,
 
   // Oracle EBS (OEBS) — enterprise data with current dates
   oebs: `
@@ -1217,18 +1222,18 @@ IMPORTANT RULES:
 - COLUMN ALIAS AWARENESS: Column descriptions often include "Also known as:" aliases. When the user's terminology doesn't match any column name exactly, scan the descriptions for the user's terms. The correct column is often named differently from what users expect.
 - When the schema includes value dictionaries (coded values), use the exact codes in WHERE clauses
 - Temperature is 0 — be deterministic and precise
-- DATE HANDLING: Date columns are stored as TEXT. Always cast to date before date operations: "date"::date, EXTRACT(YEAR FROM "date"::date), "date"::date >= '1995-01-01'. Never use EXTRACT or date functions on raw text columns.
+- DATE HANDLING: Date columns are stored as TEXT. Always cast to date before date operations: "date", EXTRACT(YEAR FROM "date"), "date" >= '1995-01-01'. Never use EXTRACT or date functions on raw text columns.
 - TIME-BOUNDED QUERIES (critical): When the user asks for "last N months/quarters/years", ALWAYS use BOTH a lower AND upper bound. "Last N months" means the N months ending with the CURRENT month (inclusive), so use INTERVAL 'N-1 months' back from the start of the current month:
-  * "last 12 months" → WHERE date::date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months' AND date::date < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+  * "last 12 months" → WHERE date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months' AND date < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
     (This gives exactly 12 months: current month + 11 prior months)
-  * "last 4 quarters" → WHERE date::date >= DATE_TRUNC('quarter', CURRENT_DATE) - INTERVAL '9 months' AND date::date < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'
-  * "this quarter" → WHERE date::date >= DATE_TRUNC('quarter', CURRENT_DATE) AND date::date < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'
-  * "this year" → WHERE date::date >= DATE_TRUNC('year', CURRENT_DATE) AND date::date < DATE_TRUNC('year', CURRENT_DATE) + INTERVAL '1 year'
+  * "last 4 quarters" → WHERE date >= DATE_TRUNC('quarter', CURRENT_DATE) - INTERVAL '9 months' AND date < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'
+  * "this quarter" → WHERE date >= DATE_TRUNC('quarter', CURRENT_DATE) AND date < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'
+  * "this year" → WHERE date >= DATE_TRUNC('year', CURRENT_DATE) AND date < DATE_TRUNC('year', CURRENT_DATE) + INTERVAL '1 year'
   Without the upper bound, future-dated records are included, giving wrong results. ALSO exclude NULL dates: AND date IS NOT NULL.
 - DATE GROUPING (critical): When grouping "by month", "by quarter", or "by year", ALWAYS use DATE_TRUNC in both SELECT and GROUP BY:
-  * "by month" → SELECT DATE_TRUNC('month', "date"::date) AS "month", ... GROUP BY DATE_TRUNC('month', "date"::date) ORDER BY "month"
-  * "by quarter" → SELECT DATE_TRUNC('quarter', "date"::date) AS "quarter", ... GROUP BY DATE_TRUNC('quarter', "date"::date) ORDER BY "quarter"
-  * "by year" → SELECT DATE_TRUNC('year', "date"::date) AS "year", ... GROUP BY DATE_TRUNC('year', "date"::date) ORDER BY "year"
+  * "by month" → SELECT DATE_TRUNC('month', "date") AS "month", ... GROUP BY DATE_TRUNC('month', "date") ORDER BY "month"
+  * "by quarter" → SELECT DATE_TRUNC('quarter', "date") AS "quarter", ... GROUP BY DATE_TRUNC('quarter', "date") ORDER BY "quarter"
+  * "by year" → SELECT DATE_TRUNC('year', "date") AS "year", ... GROUP BY DATE_TRUNC('year', "date") ORDER BY "year"
   NEVER use TO_CHAR, EXTRACT, or string formatting for date grouping. DATE_TRUNC returns proper timestamps that the UI can format correctly. TO_CHAR or EXTRACT produce strings/numbers that lose date semantics.
 
 COLUMN DISCIPLINE (critical):
@@ -1264,12 +1269,12 @@ AGGREGATION PATTERNS:
 - Return at most 100 rows unless the question implies aggregation or asks for "all"
 
 COMPUTATION:
-- For age calculations use: EXTRACT(YEAR FROM CURRENT_DATE) - EXTRACT(YEAR FROM "birth_date"::date). Do NOT use julianday.
+- For age calculations use: EXTRACT(YEAR FROM CURRENT_DATE) - EXTRACT(YEAR FROM "birth_date"). Do NOT use julianday.
 - Use CAST(... AS NUMERIC) before division to avoid integer division
 - When computing AVG with a JOIN, use the JOIN approach (not a subquery with IN) so that the average reflects the actual row distribution
 - NEVER nest aggregate functions: SUM(AVG(...)), AVG(SUM(...)), etc. are illegal in PostgreSQL. If you need to aggregate an aggregate, use a CTE or subquery: WITH avg_costs AS (SELECT item_id, AVG(cost) as avg_cost FROM ... GROUP BY item_id) SELECT SUM(avg_cost) FROM avg_costs
-- For date comparisons: ALWAYS cast text to date first — "date"::date >= '1995-01-01'. Never compare text strings as dates.
-- For year extraction: EXTRACT(YEAR FROM "date"::date) — never EXTRACT from raw text
+- For date comparisons: ALWAYS cast text to date first — "date" >= '1995-01-01'. Never compare text strings as dates.
+- For year extraction: EXTRACT(YEAR FROM "date") — never EXTRACT from raw text
 
 JOIN GUIDANCE:
 - Always check the RELATIONSHIPS section for the correct join columns
@@ -1317,7 +1322,7 @@ SQLite-SPECIFIC SYNTAX (critical):
 - Do NOT use CURRENT_DATE as a function. Use date('now').
 - Do NOT use NOW(). Use datetime('now').
 - Do NOT use LEFT(str, n). Use SUBSTR(str, 1, n).
-- Do NOT use ILIKE. Use LIKE (SQLite LIKE is case-insensitive for ASCII).
+- Do NOT use LIKE. Use LIKE (SQLite LIKE is case-insensitive for ASCII).
 - Do NOT use TRUE/FALSE. Use 1/0.
 - Do NOT use BOOLEAN logic like (column = TRUE). Use (column = 1).
 - For conditional counting use IIF(condition, 1, 0) or CASE WHEN ... THEN 1 ELSE 0 END.
@@ -1512,7 +1517,7 @@ Your response MUST follow this exact format:
       const execStart = Date.now();
       const result = await executeOnSourceData(appId, sql);
       finalExecTime = Date.now() - execStart;
-      finalRows = result.rows || [];
+      finalRows = rows || [];
       finalColumns = result.columns || (finalRows.length > 0 ? Object.keys(finalRows[0]) : []);
       finalExecError = null;
 
@@ -1565,7 +1570,7 @@ ${execErr.message}
 Please fix the SQL and try again. Common issues:
 - Column names must be double-quoted: "column_name"
 - Table names must be double-quoted: "table_name"
-- Text columns need ::date cast before date functions
+- Text columns need  cast before date functions
 - Check the schema for exact column names — don't invent columns
 - Reserved words (like "order") MUST be double-quoted
 
@@ -1673,12 +1678,11 @@ Your response MUST follow this exact format:
     }
 
     try {
-      const result = await executeOnSourceData(appId, sql);
-      const rows = result.rows || [];
+      const rows = (await executeOnSourceData(appId, sql)) || [];
       // Create a hash of the result for voting — stringify first 20 rows sorted
       const hashInput = JSON.stringify(rows.slice(0, 20));
       const hash = simpleHash(hashInput);
-      execResults.push({ index: i, sql, rows, columns: result.columns || (rows.length > 0 ? Object.keys(rows[0]) : []), hash, error: null, rawText: c.rawText });
+      execResults.push({ index: i, sql, rows, columns: rows.length > 0 ? Object.keys(rows[0]) : [], hash, error: null, rawText: c.rawText });
     } catch (execErr) {
       execResults.push({ index: i, sql, error: execErr.message, rows: [], hash: null });
     }
@@ -1764,18 +1768,18 @@ router.post('/:appId/converse', async (req, res) => {
     const startTime = Date.now();
 
     // Get app context
-    const appResult = await query('SELECT name, config FROM applications WHERE id = $1', [appId]);
-    const appName = appResult.rows[0]?.name || 'Unknown';
-    const appConfig = appResult.rows[0]?.config || {};
+    const [appRows] = await query('SELECT name, config FROM applications WHERE id = ?', [appId]);
+    const appName = appRows[0]?.name || 'Unknown';
+    const appConfig = appRows[0]?.config || {};
     const qeConfig = appConfig.query_engine || {};
 
     // Build BOKG catalog for context (same as classify endpoint)
-    const tablesResult = await query(
+    const [tablesRows] = await query(
       `SELECT t.table_name, t.entity_name, t.entity_metadata, t.description
-       FROM app_tables t WHERE t.app_id = $1`, [appId]);
+       FROM app_tables t WHERE t.app_id = ?`, [appId]);
 
     const bokgCatalog = [];
-    for (const t of tablesResult.rows) {
+    for (const t of tablesRows) {
       const entityName = t.entity_name || t.table_name;
       const meta = t.entity_metadata || {};
       const questions = meta.sample_questions || [];
@@ -1789,26 +1793,26 @@ router.post('/:appId/converse', async (req, res) => {
     // Get validated query patterns
     let validatedPatterns = [];
     try {
-      const qpdResult = await query(
+      const [qpdRows] = await query(
         `SELECT nl_query FROM test_queries
-         WHERE app_id = $1 AND feedback = 'thumbs_up'
+         WHERE app_id = ? AND feedback = 'thumbs_up'
          ORDER BY created_at DESC LIMIT 15`, [appId]);
-      validatedPatterns = qpdResult.rows.map(r => r.nl_query);
+      validatedPatterns = qpdRows.map(r => r.nl_query);
     } catch (e) { /* ignore */ }
 
     // Check for uploaded documents (for UNSTRUCTURED routing)
     let docCatalog = '';
     let hasDocuments = false;
     try {
-      const docsResult = await query(
+      const [docsRows] = await query(
         `SELECT ds.filename, dc.name as collection_name, ds.file_type
          FROM doc_sources ds
          LEFT JOIN doc_collections dc ON ds.collection_id = dc.id
-         WHERE ds.app_id = $1 AND ds.status = 'ready'
+         WHERE ds.app_id = ? AND ds.status = 'ready'
          ORDER BY ds.created_at DESC LIMIT 20`, [appId]);
-      if (docsResult.rows.length > 0) {
+      if (docsRows.length > 0) {
         hasDocuments = true;
-        const docList = docsResult.rows.map(d => `  - ${d.filename} (${d.file_type})`).join('\n');
+        const docList = docsRows.map(d => `  - ${d.filename} (${d.file_type})`).join('\n');
         docCatalog = `\n=== UPLOADED DOCUMENTS (for process/policy/procedure questions) ===\n${docList}`;
       }
     } catch (e) { /* ignore — doc tables may not exist yet */ }
@@ -2046,10 +2050,6 @@ EXISTING RULES (keep as-is):
 
 === AVAILABLE BUSINESS OBJECTS AND SAMPLE QUESTIONS ===
 ${bokgCatalog.join('\n')}
-
-${validatedPatterns.length > 0 ? `=== PROVEN QUERIES (HIGHEST PRIORITY — copy these EXACTLY when the user's intent matches) ===
-These queries have been validated by users and produce correct results. Use them verbatim whenever possible:
-${validatedPatterns.map(p => `  "${p}"`).join('\n')}` : ''}
 ${docCatalog}
 
 === CONVERSATION PHASE CONTEXT ===
@@ -2067,10 +2067,10 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
     // that the client-side fix might miss (e.g. "our aging" instead of "are aging")
     const fixBusinessAcronyms = (text) => {
       return text
-        .replace(/\b(?:are|our|r)\s+(aging)/gi, 'AR $1')
-        .replace(/\b(?:are|our|r)\s+(report)/gi, 'AR $1')
-        .replace(/\b(?:are|our|r)\s+(balance)/gi, 'AR $1')
-        .replace(/\b(?:are|our|r)\s+(receivable)/gi, 'AR $1')
+        .replace(/\b(?:are|our|r)\s+(aging)/gi, 'AR ?')
+        .replace(/\b(?:are|our|r)\s+(report)/gi, 'AR ?')
+        .replace(/\b(?:are|our|r)\s+(balance)/gi, 'AR ?')
+        .replace(/\b(?:are|our|r)\s+(receivable)/gi, 'AR ?')
         .replace(/\baccounts\s+receivable/gi, 'AR')
         .replace(/\b(?:aye|a)\s+(pee|p)\b/gi, 'AP')
         .replace(/\baccounts\s+payable/gi, 'AP')
@@ -2151,7 +2151,7 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
       const costEstimate = ((usage.input_tokens || 0) * COST_PER_INPUT_TOKEN) + ((usage.output_tokens || 0) * COST_PER_OUTPUT_TOKEN);
       await query(
         `INSERT INTO token_usage (app_id, stage, table_name, input_tokens, output_tokens, total_tokens, model, cost_estimate)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [appId, 'converse', null, usage.input_tokens || 0, usage.output_tokens || 0,
          (usage.input_tokens || 0) + (usage.output_tokens || 0), 'claude-haiku-4-5-20251001', costEstimate]
       );
@@ -2311,25 +2311,25 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
         let queryToRun = parsed.query;
         let result = null;
 
-        const templateCheck = await query(
+        const [templateCheck] = await query(
           `SELECT nl_query, generated_sql FROM test_queries
-           WHERE app_id = $1 AND feedback = 'thumbs_up'
-           AND LOWER(nl_query) = LOWER($2) LIMIT 1`, [appId, parsed.query]
+           WHERE app_id = ? AND feedback = 'thumbs_up'
+           AND LOWER(nl_query) = LOWER(?) LIMIT 1`, [appId, parsed.query]
         );
 
-        if (templateCheck.rows.length > 0 && templateCheck.rows[0].generated_sql) {
+        if (templateCheck.length > 0 && templateCheck[0].generated_sql) {
           // FAST PATH: proven query with cached SQL — skip classify + NL2SQL entirely
-          queryToRun = templateCheck.rows[0].nl_query;
-          const cachedSQL = templateCheck.rows[0].generated_sql;
+          queryToRun = templateCheck[0].nl_query;
+          const cachedSQL = templateCheck[0].generated_sql;
           console.log('[Converse] FAST PATH — cached SQL for:', queryToRun.substring(0, 60));
 
           const execStart = Date.now();
           try {
-            const execResult = await query(cachedSQL);
+            const [execRows] = await query(cachedSQL);
             result = {
               sql: cachedSQL,
-              rows: execResult.rows || [],
-              columns: execResult.rows.length > 0 ? Object.keys(execResult.rows[0]) : [],
+              rows: execRows || [],
+              columns: execRows.length > 0 ? Object.keys(execRows[0]) : [],
               execTime: Date.now() - execStart,
               execError: null,
               retryCount: 0,
@@ -2347,9 +2347,9 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
           let skipClassify = false;
 
           // Check for exact template match (for skipping classify only, SQL wasn't cached or failed)
-          if (templateCheck.rows.length > 0) {
+          if (templateCheck.length > 0) {
             skipClassify = true;
-            queryToRun = templateCheck.rows[0].nl_query;
+            queryToRun = templateCheck[0].nl_query;
           }
 
           if (!skipClassify) {
@@ -2419,13 +2419,13 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
 
         // Generate spoken answer from results
         let spokenAnswer = parsed.spoken || 'Here are your results.';
-        if (!result.execError && result.rows.length > 0) {
-          const count = result.rows.length;
+        if (!result.execError && rows.length > 0) {
+          const count = rows.length;
           const cols = result.columns || [];
           if (count === 1 && cols.length <= 3) {
             const parts = cols.map(c => {
               const name = columnBusinessNames[c.toLowerCase()] || c.replace(/_/g, ' ');
-              return `${name} is ${result.rows[0][c] ?? 'not available'}`;
+              return `${name} is ${rows[0][c] ?? 'not available'}`;
             });
             spokenAnswer = (parsed.spoken ? parsed.spoken + ' ' : '') + parts.join(', and ') + '.';
           } else if (count <= 5) {
@@ -2444,14 +2444,14 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
         let queryId = null;
         try {
           const confidence = result.execError ? 0.3 : (result.retryCount > 0 ? 0.6 : 0.8);
-          const saveResult = await query(
+          const [saveRows] = await query(
             `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id`,
+             VALUES (?, ?, ?, ?, ?, ?, NOW())`,
             [appId, req.user.id, queryToRun, result.sql,
-             JSON.stringify({ rows: result.rows.slice(0, 10), error: result.execError, row_count: result.rows.length }),
+             JSON.stringify({ rows: rows.slice(0, 10), error: result.execError, row_count: rows.length }),
              confidence]
           );
-          queryId = saveResult.rows[0]?.id || null;
+          queryId = saveRows[0]?.id || null;
         } catch (saveErr) {
           console.warn('[Converse] Failed to save query:', saveErr.message);
         }
@@ -2462,10 +2462,10 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
           query: queryToRun,
           sql: result.sql,
           queryId,
-          rows: result.rows.slice(0, 200),
+          rows: rows.slice(0, 200),
           columns: result.columns,
           column_business_names: columnBusinessNames,
-          row_count: result.rows.length,
+          row_count: rows.length,
           executionTime: result.execTime ? `${result.execTime}ms` : null,
           generationTime: `${Date.now() - startTime}ms`,
           error: result.execError,
@@ -2504,24 +2504,24 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
             let queryToRun = qItem.query;
 
             // FAST PATH: check for cached proven SQL first
-            const templateCheck = await query(
+            const [templateCheck] = await query(
               `SELECT nl_query, generated_sql FROM test_queries
-               WHERE app_id = $1 AND feedback = 'thumbs_up'
-               AND LOWER(nl_query) = LOWER($2) LIMIT 1`, [appId, qItem.query]
+               WHERE app_id = ? AND feedback = 'thumbs_up'
+               AND LOWER(nl_query) = LOWER(?) LIMIT 1`, [appId, qItem.query]
             );
 
             let result = null;
-            if (templateCheck.rows.length > 0 && templateCheck.rows[0].generated_sql) {
-              queryToRun = templateCheck.rows[0].nl_query;
-              const cachedSQL = templateCheck.rows[0].generated_sql;
+            if (templateCheck.length > 0 && templateCheck[0].generated_sql) {
+              queryToRun = templateCheck[0].nl_query;
+              const cachedSQL = templateCheck[0].generated_sql;
               console.log('[Converse/Multi] FAST PATH for:', qItem.label, '→', queryToRun.substring(0, 50));
               try {
                 const execStart = Date.now();
-                const execResult = await query(cachedSQL);
+                const [execRows] = await query(cachedSQL);
                 result = {
                   sql: cachedSQL,
-                  rows: execResult.rows || [],
-                  columns: execResult.rows.length > 0 ? Object.keys(execResult.rows[0]) : [],
+                  rows: execRows || [],
+                  columns: execRows.length > 0 ? Object.keys(execRows[0]) : [],
                   execTime: Date.now() - execStart,
                   execError: null,
                   retryCount: 0,
@@ -2535,7 +2535,7 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
 
             if (!result) {
               // FULL PATH: NL2SQL pipeline with parallel prep
-              if (templateCheck.rows.length > 0) queryToRun = templateCheck.rows[0].nl_query;
+              if (templateCheck.length > 0) queryToRun = templateCheck[0].nl_query;
 
               const [linkedTableIds, valueDictionaries, fewShotSection, contextSection] = await Promise.all([
                 schemaLink(appId, queryToRun, qeConfig.schema_link_threshold),
@@ -2556,14 +2556,14 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
             let queryId = null;
             try {
               const confidence = result.execError ? 0.3 : (result.retryCount > 0 ? 0.6 : 0.8);
-              const saveResult = await query(
+              const [saveRows] = await query(
                 `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id`,
+                 VALUES (?, ?, ?, ?, ?, ?, NOW())`,
                 [appId, req.user.id, queryToRun, result.sql,
-                 JSON.stringify({ rows: result.rows.slice(0, 10), error: result.execError, row_count: result.rows.length }),
+                 JSON.stringify({ rows: rows.slice(0, 10), error: result.execError, row_count: rows.length }),
                  confidence]
               );
-              queryId = saveResult.rows[0]?.id || null;
+              queryId = saveRows[0]?.id || null;
             } catch (saveErr) {
               console.warn('[Converse/Multi] Failed to save query:', saveErr.message);
             }
@@ -2573,10 +2573,10 @@ ${pendingQueries.map(q => `  - "${typeof q === 'string' ? q : q.label || q.query
               query: queryToRun,
               sql: result.sql,
               queryId,
-              rows: result.rows.slice(0, 200),
+              rows: rows.slice(0, 200),
               columns: result.columns,
               column_business_names: columnBusinessNames,
-              row_count: result.rows.length,
+              row_count: rows.length,
               executionTime: result.execTime ? `${result.execTime}ms` : null,
               error: result.execError,
               retryCount: result.retryCount,
@@ -2686,9 +2686,9 @@ router.post('/:appId/converse/execute', async (req, res) => {
     }
 
     const startTime = Date.now();
-    const appResult = await query('SELECT name, config FROM applications WHERE id = $1', [appId]);
-    const appName = appResult.rows[0]?.name || 'Unknown';
-    const appConfig = appResult.rows[0]?.config || {};
+    const [appRows] = await query('SELECT name, config FROM applications WHERE id = ?', [appId]);
+    const appName = appRows[0]?.name || 'Unknown';
+    const appConfig = appRows[0]?.config || {};
     const qeConfig = appConfig.query_engine || {};
 
     console.log('[BatchExec] Processing', queries.length, 'queued queries');
@@ -2729,24 +2729,24 @@ router.post('/:appId/converse/execute', async (req, res) => {
         let queryToRun = qItem.query;
 
         // FAST PATH: check for cached proven SQL first
-        const templateCheck = await query(
+        const [templateCheck] = await query(
           `SELECT nl_query, generated_sql FROM test_queries
-           WHERE app_id = $1 AND feedback = 'thumbs_up'
-           AND LOWER(nl_query) = LOWER($2) LIMIT 1`, [appId, qItem.query]
+           WHERE app_id = ? AND feedback = 'thumbs_up'
+           AND LOWER(nl_query) = LOWER(?) LIMIT 1`, [appId, qItem.query]
         );
 
         let result = null;
-        if (templateCheck.rows.length > 0 && templateCheck.rows[0].generated_sql) {
-          queryToRun = templateCheck.rows[0].nl_query;
-          const cachedSQL = templateCheck.rows[0].generated_sql;
+        if (templateCheck.length > 0 && templateCheck[0].generated_sql) {
+          queryToRun = templateCheck[0].nl_query;
+          const cachedSQL = templateCheck[0].generated_sql;
           console.log('[BatchExec] FAST PATH for:', qItem.label, '→', queryToRun.substring(0, 50));
           try {
             const execStart = Date.now();
-            const execResult = await query(cachedSQL);
+            const [execRows] = await query(cachedSQL);
             result = {
               sql: cachedSQL,
-              rows: execResult.rows || [],
-              columns: execResult.rows.length > 0 ? Object.keys(execResult.rows[0]) : [],
+              rows: execRows || [],
+              columns: execRows.length > 0 ? Object.keys(execRows[0]) : [],
               execTime: Date.now() - execStart,
               execError: null,
               retryCount: 0,
@@ -2760,7 +2760,7 @@ router.post('/:appId/converse/execute', async (req, res) => {
 
         if (!result) {
           // FULL PATH: NL2SQL pipeline
-          if (templateCheck.rows.length > 0) queryToRun = templateCheck.rows[0].nl_query;
+          if (templateCheck.length > 0) queryToRun = templateCheck[0].nl_query;
 
           const [linkedTableIds, valueDictionaries, fewShotSection, contextSection] = await Promise.all([
             schemaLink(appId, queryToRun, qeConfig.schema_link_threshold),
@@ -2781,14 +2781,14 @@ router.post('/:appId/converse/execute', async (req, res) => {
         let queryId = null;
         try {
           const confidence = result.execError ? 0.3 : (result.retryCount > 0 ? 0.6 : 0.8);
-          const saveResult = await query(
+          const [saveRows] = await query(
             `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id`,
+             VALUES (?, ?, ?, ?, ?, ?, NOW())`,
             [appId, req.user.id, queryToRun, result.sql,
-             JSON.stringify({ rows: result.rows.slice(0, 10), error: result.execError, row_count: result.rows.length }),
+             JSON.stringify({ rows: rows.slice(0, 10), error: result.execError, row_count: rows.length }),
              confidence]
           );
-          queryId = saveResult.rows[0]?.id || null;
+          queryId = saveRows[0]?.id || null;
         } catch (saveErr) {
           console.warn('[BatchExec] Failed to save query:', saveErr.message);
         }
@@ -2798,10 +2798,10 @@ router.post('/:appId/converse/execute', async (req, res) => {
           query: queryToRun,
           sql: result.sql,
           queryId,
-          rows: result.rows.slice(0, 200),
+          rows: rows.slice(0, 200),
           columns: result.columns,
           column_business_names: columnBusinessNames,
-          row_count: result.rows.length,
+          row_count: rows.length,
           executionTime: result.execTime ? `${result.execTime}ms` : null,
           error: result.execError,
           retryCount: result.retryCount,
@@ -2881,7 +2881,7 @@ router.post('/:appId/converse/briefing', async (req, res) => {
     const isCurrencyCol = (colName, bizName, label) => {
       return CURRENCY_COL_RE.test(colName) || CURRENCY_COL_RE.test(bizName || '') || CURRENCY_COL_RE.test(label || '');
     };
-    const fmtCurrency = (val) => `$${val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const fmtCurrency = (val) => `?)}`;
 
     // Build data sections for the briefing
     const sections = results.map(r => {
@@ -3008,18 +3008,18 @@ router.post('/:appId/converse/briefing', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 async function classifyIntent(appId, question) {
   // Get app context for classification
-  const appResult = await query('SELECT name FROM applications WHERE id = $1', [appId]);
-  const appName = appResult.rows[0]?.name || 'Unknown';
+  const [appRows] = await query('SELECT name FROM applications WHERE id = ?', [appId]);
+  const appName = appRows[0]?.name || 'Unknown';
 
   // Get table/column info with entity_metadata (business questions, sample questions)
-  const tablesResult = await query(
+  const [tablesRows] = await query(
     `SELECT t.table_name, t.entity_name, t.entity_metadata, t.description
-     FROM app_tables t WHERE t.app_id = $1`, [appId]);
+     FROM app_tables t WHERE t.app_id = ?`, [appId]);
 
   // Build BOKG catalog: business objects with their questions
   const bokgCatalog = [];
   const allBusinessQuestions = [];
-  for (const t of tablesResult.rows) {
+  for (const t of tablesRows) {
     const entityName = t.entity_name || t.table_name;
     const meta = t.entity_metadata || {};
     const questions = meta.sample_questions || [];
@@ -3034,11 +3034,11 @@ async function classifyIntent(appId, question) {
   // Get validated query patterns from QPD (proven queries with thumbs-up)
   let validatedPatterns = [];
   try {
-    const qpdResult = await query(
+    const [qpdRows] = await query(
       `SELECT nl_query FROM test_queries
-       WHERE app_id = $1 AND feedback = 'thumbs_up'
+       WHERE app_id = ? AND feedback = 'thumbs_up'
        ORDER BY created_at DESC LIMIT 20`, [appId]);
-    validatedPatterns = qpdResult.rows.map(r => r.nl_query);
+    validatedPatterns = qpdRows.map(r => r.nl_query);
   } catch (e) { /* ignore */ }
 
   const API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -3163,9 +3163,7 @@ RULES:
 RESPOND WITH ONLY THE JSON OBJECT. No markdown, no explanation, no code fences.
 
 === AVAILABLE BUSINESS OBJECTS AND QUESTIONS ===
-${bokgCatalog.join('\n')}
-
-${validatedPatterns.length > 0 ? `=== VALIDATED QUERY PATTERNS (highest-confidence suggestions) ===\n${validatedPatterns.map(p => `  "${p}"`).join('\n')}` : ''}`;
+${bokgCatalog.join('\n')}`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -3260,7 +3258,7 @@ ${validatedPatterns.length > 0 ? `=== VALIDATED QUERY PATTERNS (highest-confiden
     const costEstimate = ((usage.input_tokens || 0) * 3 / 1000000) + ((usage.output_tokens || 0) * 15 / 1000000);
     await query(
       `INSERT INTO token_usage (app_id, stage, table_name, input_tokens, output_tokens, total_tokens, model, cost_estimate)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [appId, 'classify', null, usage.input_tokens || 0, usage.output_tokens || 0,
        (usage.input_tokens || 0) + (usage.output_tokens || 0), 'claude-sonnet-4-20250514', costEstimate]
     );
@@ -3318,9 +3316,9 @@ router.post('/:appId/nl2sql', async (req, res) => {
     }
 
     // Get app info + config
-    const appResult = await query('SELECT name, config FROM applications WHERE id = $1', [appId]);
-    const appName = appResult.rows[0]?.name || 'Unknown';
-    const appConfig = appResult.rows[0]?.config || {};
+    const [appRows] = await query('SELECT name, config FROM applications WHERE id = ?', [appId]);
+    const appName = appRows[0]?.name || 'Unknown';
+    const appConfig = appRows[0]?.config || {};
     const qeConfig = appConfig.query_engine || {};
 
     const startTime = Date.now();
@@ -3353,7 +3351,7 @@ router.post('/:appId/nl2sql', async (req, res) => {
                            (result.token_usage.output_tokens * COST_PER_OUTPUT_TOKEN);
       await query(
         `INSERT INTO token_usage (app_id, stage, table_name, input_tokens, output_tokens, total_tokens, model, cost_estimate)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [appId, 'nl2sql', null, result.token_usage.input_tokens, result.token_usage.output_tokens,
          result.token_usage.total_tokens, 'claude-sonnet-4-20250514', costEstimate]
       );
@@ -3365,15 +3363,14 @@ router.post('/:appId/nl2sql', async (req, res) => {
     let queryId = null;
     try {
       const confidence = result.execError ? 0.3 : (result.retryCount > 0 ? 0.6 : 0.8);
-      const saveResult = await query(
+      const [saveRows] = await query(
         `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, NOW())
-         RETURNING id`,
+         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
         [appId, req.user.id, question, result.sql,
-         JSON.stringify({ rows: result.rows.slice(0, 10), error: result.execError, row_count: result.rows.length }),
+         JSON.stringify({ rows: rows.slice(0, 10), error: result.execError, row_count: rows.length }),
          confidence]
       );
-      queryId = saveResult.rows[0]?.id || null;
+      queryId = saveRows[0]?.id || null;
     } catch (saveErr) {
       console.warn('Failed to save test query:', saveErr.message);
     }
@@ -3384,10 +3381,10 @@ router.post('/:appId/nl2sql', async (req, res) => {
     res.json({
       sql: result.sql,
       queryId,
-      rows: result.rows.slice(0, 200),
+      rows: rows.slice(0, 200),
       columns: result.columns,
       column_business_names: columnBusinessNames,
-      row_count: result.rows.length,
+      row_count: rows.length,
       executionTime: result.execTime ? `${result.execTime}ms` : null,
       generationTime: `${genTime}ms`,
       error: result.execError,
@@ -3436,14 +3433,14 @@ router.post('/:appId/seed-qpd', async (req, res) => {
     }
 
     // Get app info
-    const appResult = await query('SELECT name FROM applications WHERE id = $1', [appId]);
-    const appName = appResult.rows[0]?.name || 'Unknown';
+    const [appRows] = await query('SELECT name FROM applications WHERE id = ?', [appId]);
+    const appName = appRows[0]?.name || 'Unknown';
 
     // Clear previous system-seeded QPD entries for this app
     await query(
-      `DELETE FROM test_queries WHERE app_id = $1 AND feedback = 'thumbs_up'
+      `DELETE FROM test_queries WHERE app_id = ? AND feedback = 'thumbs_up'
        AND nl_query IN (
-         SELECT nl_query FROM test_queries WHERE app_id = $1 AND confidence = 0.90
+         SELECT nl_query FROM test_queries WHERE app_id = ? AND confidence = 0.90
        )
        AND confidence = 0.90`,
       [appId]
@@ -3451,17 +3448,17 @@ router.post('/:appId/seed-qpd', async (req, res) => {
 
     // Collect sample questions grouped by business object (entity_name)
     // Multiple tables may share an entity_name — we collect questions per entity, not per table
-    const entitiesResult = await query(
+    const [entitiesRows] = await query(
       `SELECT entity_name, table_name, entity_metadata
        FROM app_tables
-       WHERE app_id = $1 AND entity_metadata IS NOT NULL
+       WHERE app_id = ? AND entity_metadata IS NOT NULL
        ORDER BY entity_name, table_name`,
       [appId]
     );
 
     // Group by entity (business object)
     const entityQuestions = {};
-    for (const row of entitiesResult.rows) {
+    for (const row of entitiesRows) {
       const entityKey = row.entity_name || row.table_name;
       const meta = row.entity_metadata || {};
       const questions = meta.sample_questions || [];
@@ -3510,16 +3507,16 @@ router.post('/:appId/seed-qpd', async (req, res) => {
           appId, question, bokgContext, appName, '', valueDictionaries
         );
 
-        if (!genResult.execError && genResult.rows.length > 0) {
+        if (!genResult.execError && genRows.length > 0) {
           await query(
             `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, feedback, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
             [appId, req.user.id, question, genResult.sql,
-             JSON.stringify({ rows: genResult.rows.slice(0, 5), row_count: genResult.rows.length, source: 'qpd_seed', entity: entityName }),
+             JSON.stringify({ rows: genRows.slice(0, 5), row_count: genRows.length, source: 'qpd_seed', entity: entityName }),
              0.90, 'thumbs_up']
           );
-          console.log(`    ✓ Seeded (${genResult.rows.length} rows, ${genResult.retryCount} retries)`);
-          return { entityName, question, status: 'seeded', rows: genResult.rows.length, retries: genResult.retryCount };
+          console.log(`    ✓ Seeded (${genRows.length} rows, ${genResult.retryCount} retries)`);
+          return { entityName, question, status: 'seeded', rows: genRows.length, retries: genResult.retryCount };
         } else {
           const reason = genResult.execError || 'returned 0 rows';
           console.log(`    ✗ Failed: ${reason.substring(0, 100)}`);
@@ -3561,7 +3558,7 @@ router.post('/:appId/seed-qpd', async (req, res) => {
 router.get('/:appId/qpd-status', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query(
+    const [rows] = await query(
       `SELECT
          COUNT(*) FILTER (WHERE feedback = 'thumbs_up') as approved,
          COUNT(*) FILTER (WHERE feedback = 'thumbs_down') as rejected,
@@ -3569,10 +3566,10 @@ router.get('/:appId/qpd-status', async (req, res) => {
          COUNT(*) FILTER (WHERE confidence = 0.90 AND feedback = 'thumbs_up') as system_seeded,
          COUNT(*) FILTER (WHERE confidence != 0.90 AND feedback = 'thumbs_up') as user_verified,
          COUNT(*) as total
-       FROM test_queries WHERE app_id = $1`,
+       FROM test_queries WHERE app_id = ?`,
       [appId]
     );
-    res.json({ qpd: result.rows[0] });
+    res.json({ qpd: rows[0] });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -3596,12 +3593,12 @@ router.post('/:appId/query', async (req, res) => {
 router.get('/:appId/query-history', async (req, res) => {
   try {
     const { appId } = req.params;
-    const result = await query(
+    const [rows] = await query(
       `SELECT id, nl_query, generated_sql, execution_result, confidence, feedback, created_at
-       FROM test_queries WHERE app_id = $1 ORDER BY created_at DESC LIMIT 50`,
+       FROM test_queries WHERE app_id = ? ORDER BY created_at DESC LIMIT 50`,
       [appId]
     );
-    res.json({ queries: result.rows });
+    res.json({ queries: rows });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -3619,21 +3616,21 @@ router.post('/:appId/query/:queryId/feedback', async (req, res) => {
     if (!['thumbs_up', 'thumbs_down'].includes(feedback)) {
       return res.status(400).json({ error: 'Feedback must be thumbs_up or thumbs_down' });
     }
-    const result = await query(
-      'UPDATE test_queries SET feedback = $1 WHERE id = $2 AND app_id = $3 RETURNING *',
+    const [rows] = await query(
+      'UPDATE test_queries SET feedback = ? WHERE id = ? AND app_id = ?',
       [feedback, queryId, appId]
     );
 
     // For thumbs_down on system-seeded entries, log it so we know the QPD needs improvement
-    if (feedback === 'thumbs_down' && result.rows[0]) {
-      const entry = result.rows[0];
+    if (feedback === 'thumbs_down' && rows[0]) {
+      const entry = rows[0];
       const isSystemSeeded = parseFloat(entry.confidence) === 0.90;
       if (isSystemSeeded) {
         console.log(`QPD feedback: system-seeded query demoted — "${(entry.nl_query || '').substring(0, 60)}"`);
       }
     }
 
-    res.json({ query: result.rows[0], message: `Feedback: ${feedback}` });
+    res.json({ query: rows[0], message: `Feedback: ${feedback}` });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -3643,7 +3640,7 @@ router.post('/:appId/query/:queryId/feedback', async (req, res) => {
 router.delete('/:appId/query/:queryId', async (req, res) => {
   try {
     const { appId, queryId } = req.params;
-    await query('DELETE FROM test_queries WHERE id = $1 AND app_id = $2', [queryId, appId]);
+    await query('DELETE FROM test_queries WHERE id = ? AND app_id = ?', [queryId, appId]);
     res.json({ message: 'Query deleted' });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
@@ -3667,7 +3664,7 @@ router.post('/:appId/import-qpd', async (req, res) => {
       try {
         await query(
           `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, feedback, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
            ON CONFLICT DO NOTHING`,
           [appId, req.user.id, q.nl_query, q.sql_template || '',
            JSON.stringify({ source: 'prototype_import', objects: q.objects || [] }),
@@ -3865,34 +3862,34 @@ router.post('/:appId/demo/boost-revenue', async (req, res) => {
     const { force } = req.body || {};
 
     // Check if already boosted (allow force re-run)
-    const check = await query(
+    const [check] = await query(
       `SELECT COUNT(*) as cnt FROM ${s}."RA_CUSTOMER_TRX_ALL" WHERE "COMMENTS" = 'DEMO_BOOST_Q1_2026'`
     );
-    if (check.rows[0].cnt > 0 && !force) {
-      return res.json({ status: 'already_boosted', message: `Revenue already boosted (${check.rows[0].cnt} invoices exist). Pass {"force": true} to re-run.` });
+    if (check[0].cnt > 0 && !force) {
+      return res.json({ status: 'already_boosted', message: `Revenue already boosted (${check[0].cnt} invoices exist). Pass {"force": true} to re-run.` });
     }
     // Clean up any previous boost data
-    if (check.rows[0].cnt > 0) {
+    if (check[0].cnt > 0) {
       await query(`DELETE FROM ${s}."RA_CUSTOMER_TRX_LINES_ALL" WHERE "CREATED_BY" = 'DEMO_BOOST'`);
       await query(`DELETE FROM ${s}."RA_CUSTOMER_TRX_ALL" WHERE "COMMENTS" = 'DEMO_BOOST_Q1_2026'`);
       console.log('[Demo] Cleaned up previous boost data');
     }
 
     // Get max IDs from existing data
-    const maxTrx = await query(`SELECT COALESCE(MAX("CUSTOMER_TRX_ID"), 0) as m FROM ${s}."RA_CUSTOMER_TRX_ALL"`);
-    const maxLine = await query(`SELECT COALESCE(MAX("CUSTOMER_TRX_LINE_ID"), 0) as m FROM ${s}."RA_CUSTOMER_TRX_LINES_ALL"`);
-    let nextTrxId = maxTrx.rows[0].m + 1;
-    let nextLineId = maxLine.rows[0].m + 1;
+    const [maxTrx] = await query(`SELECT COALESCE(MAX("CUSTOMER_TRX_ID"), 0) as m FROM ${s}."RA_CUSTOMER_TRX_ALL"`);
+    const [maxLine] = await query(`SELECT COALESCE(MAX("CUSTOMER_TRX_LINE_ID"), 0) as m FROM ${s}."RA_CUSTOMER_TRX_LINES_ALL"`);
+    let nextTrxId = maxTrx[0].m + 1;
+    let nextLineId = maxLine[0].m + 1;
 
     // Get existing customer IDs and batch sources
-    const custResult = await query(`SELECT DISTINCT "BILL_TO_CUSTOMER_ID" FROM ${s}."RA_CUSTOMER_TRX_ALL" WHERE "BILL_TO_CUSTOMER_ID" IS NOT NULL LIMIT 20`);
-    const customers = custResult.rows.map(r => r.BILL_TO_CUSTOMER_ID);
+    const [custRows] = await query(`SELECT DISTINCT "BILL_TO_CUSTOMER_ID" FROM ${s}."RA_CUSTOMER_TRX_ALL" WHERE "BILL_TO_CUSTOMER_ID" IS NOT NULL LIMIT 20`);
+    const customers = custRows.map(r => r.BILL_TO_CUSTOMER_ID);
     const batchSources = [1001, 1002, 1003, 1004, 1005];
 
     // Invoice plan: ~25 invoices across Jan-Mar 2026, each with 2-4 lines
-    // Target: add ~$55M to bring Q1 revenue from $6M to ~$61M
+    // Target: add ~?M to bring Q1 revenue from ?M to ~?M
     const invoicePlan = [
-      // January: 9 invoices, ~$22M
+      // January: 9 invoices, ~?M
       { date: '2026-01-05', lines: [{amt: 850000}, {amt: 720000}, {amt: 430000}] },
       { date: '2026-01-08', lines: [{amt: 1250000}, {amt: 980000}] },
       { date: '2026-01-12', lines: [{amt: 640000}, {amt: 510000}, {amt: 380000}] },
@@ -3902,7 +3899,7 @@ router.post('/:appId/demo/boost-revenue', async (req, res) => {
       { date: '2026-01-25', lines: [{amt: 780000}, {amt: 560000}] },
       { date: '2026-01-28', lines: [{amt: 1050000}, {amt: 720000}, {amt: 490000}] },
       { date: '2026-01-31', lines: [{amt: 960000}, {amt: 640000}] },
-      // February: 9 invoices, ~$18M
+      // February: 9 invoices, ~?M
       { date: '2026-02-03', lines: [{amt: 750000}, {amt: 520000}, {amt: 380000}] },
       { date: '2026-02-06', lines: [{amt: 1100000}, {amt: 680000}] },
       { date: '2026-02-10', lines: [{amt: 890000}, {amt: 610000}] },
@@ -3912,7 +3909,7 @@ router.post('/:appId/demo/boost-revenue', async (req, res) => {
       { date: '2026-02-24', lines: [{amt: 1050000}, {amt: 690000}] },
       { date: '2026-02-26', lines: [{amt: 780000}, {amt: 450000}] },
       { date: '2026-02-28', lines: [{amt: 920000}, {amt: 580000}] },
-      // March: 7 invoices, ~$15M
+      // March: 7 invoices, ~?M
       { date: '2026-03-03', lines: [{amt: 850000}, {amt: 640000}] },
       { date: '2026-03-07', lines: [{amt: 1150000}, {amt: 780000}] },
       { date: '2026-03-11', lines: [{amt: 720000}, {amt: 510000}, {amt: 390000}] },
@@ -3920,7 +3917,7 @@ router.post('/:appId/demo/boost-revenue', async (req, res) => {
       { date: '2026-03-18', lines: [{amt: 860000}, {amt: 590000}] },
       { date: '2026-03-21', lines: [{amt: 1100000}, {amt: 730000}] },
       { date: '2026-03-25', lines: [{amt: 940000}, {amt: 620000}] },
-      // Additional large invoices to bring Q1 total to ~$61M
+      // Additional large invoices to bring Q1 total to ~?M
       { date: '2026-01-10', lines: [{amt: 2150000}, {amt: 1850000}] },
       { date: '2026-01-20', lines: [{amt: 1950000}, {amt: 1450000}] },
       { date: '2026-02-08', lines: [{amt: 1750000}, {amt: 1350000}] },
@@ -3967,7 +3964,7 @@ router.post('/:appId/demo/boost-revenue', async (req, res) => {
     }
 
     // Verify new Q1 total
-    const newTotal = await query(
+    const [newTotal] = await query(
       `SELECT SUM(l."EXTENDED_AMOUNT") as total
        FROM ${s}."RA_CUSTOMER_TRX_LINES_ALL" l
        JOIN ${s}."RA_CUSTOMER_TRX_ALL" h ON l."CUSTOMER_TRX_ID" = h."CUSTOMER_TRX_ID"
@@ -3979,9 +3976,9 @@ router.post('/:appId/demo/boost-revenue', async (req, res) => {
       invoices_added: totalInvoices,
       lines_added: totalLines,
       revenue_added: totalRevenue,
-      q1_2026_total: parseFloat(newTotal.rows[0].total),
+      q1_2026_total: parseFloat(newTotal[0].total),
     });
-    console.log(`[Demo] Revenue boosted: +${totalInvoices} invoices, +${totalLines} lines, +$${(totalRevenue/1e6).toFixed(1)}M. Q1 total: $${(parseFloat(newTotal.rows[0].total)/1e6).toFixed(1)}M`);
+    console.log(`[Demo] Revenue boosted: +${totalInvoices} invoices, +${totalLines} lines, +?M. Q1 total: ?M`);
   } catch (err) {
     console.error('[Demo] Boost revenue error:', err.message);
     res.status(500).json({ error: err.message });

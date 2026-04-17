@@ -29,9 +29,9 @@ const router = express.Router();
 async function runFullBOKGPipeline(appId, question, evidence = null, pipelineOptions = {}) {
   const { dialect = 'postgresql', selfConsistency = 1, dryRun = false } = pipelineOptions;
 
-  const appResult = await query('SELECT name, config FROM applications WHERE id = $1', [appId]);
-  const appName = appResult.rows[0]?.name || 'Unknown';
-  const appConfig = appResult.rows[0]?.config || {};
+  const [appRows] = await query('SELECT name, config FROM applications WHERE id = ?', [appId]);
+  const appName = appRows[0]?.name || 'Unknown';
+  const appConfig = appRows[0]?.config || {};
   const qeConfig = appConfig.query_engine || {};
 
   const [linkedTableIds, valueDictionaries, fewShotSection, contextSection] = await Promise.all([
@@ -53,7 +53,7 @@ async function runFullBOKGPipeline(appId, question, evidence = null, pipelineOpt
     appId, questionWithEvidence, bokgContext, appName, fewShotSection, valueDictionaries, contextSection, qeConfig.model, options
   );
 
-  const rows = result.rows || [];
+  const rows = rows || [];
   const columns = result.columns || (rows.length > 0 ? Object.keys(rows[0]) : []);
   const topScore = linkedTableIds?.[0]?.relevanceScore || 0;
 
@@ -96,14 +96,14 @@ router.post('/', async (req, res) => {
 
     if (wsId) {
       // New workspace model: resolve appId from workspace
-      const wsResult = await query('SELECT app_id FROM workspaces WHERE id = $1', [wsId]);
-      if (wsResult.rows.length > 0 && wsResult.rows[0].app_id) {
-        appId = wsResult.rows[0].app_id;
+      const [wsRows] = await query('SELECT app_id FROM workspaces WHERE id = ?', [wsId]);
+      if (wsRows.length > 0 && wsRows[0].app_id) {
+        appId = wsRows[0].app_id;
       }
     } else if (appId) {
       // Backward compat: try to find workspace for this app
-      const wsLookup = await query('SELECT id FROM workspaces WHERE app_id = $1 LIMIT 1', [appId]);
-      if (wsLookup.rows.length > 0) wsId = wsLookup.rows[0].id;
+      const [wsLookup] = await query('SELECT id FROM workspaces WHERE app_id = ? LIMIT 1', [appId]);
+      if (wsLookup.length > 0) wsId = wsLookup[0].id;
     }
 
     if (!appId && !wsId) {
@@ -112,23 +112,23 @@ router.post('/', async (req, res) => {
 
     // If cross-workspace search requested, load all user's workspace IDs
     if (searchAllWorkspaces && userId) {
-      const allWs = await query(
+      const [allWs] = await query(
         `SELECT w.id, w.app_id FROM workspaces w
          JOIN workspace_members wm ON w.id = wm.workspace_id
-         WHERE wm.user_id = $1 AND wm.enabled = TRUE AND w.status = 'active'`,
+         WHERE wm.user_id = ? AND wm.enabled = 1 AND w.status = 'active'`,
         [userId]
       );
-      allUserWorkspaceIds = allWs.rows.map(r => r.id);
+      allUserWorkspaceIds = allWs.map(r => r.id);
     }
 
     // Load recent conversation history for context
-    const historyResult = await query(
+    const [historyRows] = await query(
       `SELECT role, content FROM ida_conversations
-       WHERE session_id = $1 AND (app_id = $2 OR workspace_id = $3)
+       WHERE session_id = ? AND (app_id = ? OR workspace_id = ?)
        ORDER BY created_at DESC LIMIT 10`,
       [sid, appId, wsId]
     );
-    const conversationHistory = historyResult.rows.reverse();
+    const conversationHistory = historyRows.reverse();
 
     // 1. Classify intent (workspace-aware: knows about both structured data and documents)
     const classification = await classifyIntent(question, { appId, workspaceId: wsId });
@@ -137,7 +137,7 @@ router.post('/', async (req, res) => {
     // Save user message
     await query(
       `INSERT INTO ida_conversations (app_id, workspace_id, user_id, session_id, role, content, intent, confidence)
-       VALUES ($1, $2, $3, $4, 'user', $5, $6, $7)`,
+       VALUES (?, ?, ?, ?, 'user', ?, ?, ?)`,
       [appId, wsId, userId, sid, question, intent, String(intentConfidence)]
     );
 
@@ -340,7 +340,7 @@ router.post('/', async (req, res) => {
     // Save assistant response
     await query(
       `INSERT INTO ida_conversations (app_id, workspace_id, user_id, session_id, role, content, intent, response_data, confidence, token_usage)
-       VALUES ($1, $2, $3, $4, 'assistant', $5, $6, $7, $8, $9)`,
+       VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?, ?, ?)`,
       [appId, wsId, userId, sid, response.answer,
        response.intent, JSON.stringify(response),
        response.confidence, JSON.stringify(response.tokenUsage)]
@@ -366,14 +366,14 @@ router.get('/history', async (req, res) => {
       return res.status(400).json({ error: 'sessionId and appId required' });
     }
 
-    const result = await query(
+    const [rows] = await query(
       `SELECT id, role, content, intent, confidence, response_data, created_at
        FROM ida_conversations
-       WHERE session_id = $1 AND app_id = $2
+       WHERE session_id = ? AND app_id = ?
        ORDER BY created_at ASC`,
       [sessionId, appId]
     );
-    res.json({ messages: result.rows });
+    res.json({ messages: rows });
   } catch (err) {
     console.error('History error:', err.message);
     res.status(500).json({ error: err.message });
@@ -386,20 +386,20 @@ router.get('/sessions', async (req, res) => {
     const { appId } = req.query;
     if (!appId) return res.status(400).json({ error: 'appId required' });
 
-    const result = await query(
+    const [rows] = await query(
       `SELECT session_id, MIN(created_at) as started_at, MAX(created_at) as last_message,
               COUNT(*) as message_count,
               (SELECT content FROM ida_conversations ic2
                WHERE ic2.session_id = ic.session_id AND ic2.role = 'user'
                ORDER BY ic2.created_at ASC LIMIT 1) as first_question
        FROM ida_conversations ic
-       WHERE app_id = $1
+       WHERE app_id = ?
        GROUP BY session_id
        ORDER BY MAX(created_at) DESC
        LIMIT 50`,
       [appId]
     );
-    res.json({ sessions: result.rows });
+    res.json({ sessions: rows });
   } catch (err) {
     console.error('Sessions error:', err.message);
     res.status(500).json({ error: err.message });

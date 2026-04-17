@@ -14,22 +14,22 @@ router.get('/:appId/tables', async (req, res) => {
       return res.json({ available: false, tables: [], message: 'Run the pipeline first to load source data.' });
     }
 
-    const result = await query(
+    const [rows] = await query(
       `SELECT id, table_name, entity_name, row_count, description
-       FROM app_tables WHERE app_id = $1 ORDER BY table_name`,
+       FROM app_tables WHERE app_id = ? ORDER BY table_name`,
       [appId]
     );
 
     // If any tables have row_count = 0 or null, query actual source data for counts
     const schemaName = `appdata_${appId}`;
-    const tables = result.rows;
+    const tables = rows;
     for (const table of tables) {
       if (!table.row_count) {
         try {
-          const countRes = await query(`SELECT COUNT(*) as cnt FROM ${schemaName}."${table.table_name}"`);
-          table.row_count = parseInt(countRes.rows[0].cnt);
+          const [countRes] = await query(`SELECT COUNT(*) as cnt FROM \`${schemaName}\`.\`${table.table_name}\``);
+          table.row_count = parseInt(countRes[0].cnt);
           // Also update the stored value for next time
-          await query('UPDATE app_tables SET row_count = $1 WHERE id = $2', [table.row_count, table.id]);
+          await query('UPDATE app_tables SET row_count = ? WHERE id = ?', [table.row_count, table.id]);
         } catch (e) { /* ignore count errors */ }
       }
     }
@@ -56,18 +56,18 @@ router.get('/:appId/browse/:tableName', async (req, res) => {
     const result = await browseTable(appId, tableName, { limit, offset });
 
     // Also fetch column enrichment metadata
-    const colMeta = await query(
+    const [colMeta] = await query(
       `SELECT ac.column_name, ac.business_name, ac.description, ac.enrichment_status, ac.confidence_score
        FROM app_columns ac
        JOIN app_tables at ON ac.table_id = at.id
-       WHERE at.app_id = $1 AND at.table_name = $2
+       WHERE at.app_id = ? AND at.table_name = ?
        ORDER BY ac.column_name`,
       [appId, tableName]
     );
 
     res.json({
       ...result,
-      column_metadata: colMeta.rows,
+      column_metadata: colMeta,
     });
   } catch (err) {
     console.error('Browse table error:', err);

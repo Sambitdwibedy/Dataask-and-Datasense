@@ -11,7 +11,7 @@
  */
 const { pool, query } = require('../db');
 
-// Cost estimates: Sonnet input=$3/MTok, output=$15/MTok
+// Cost estimates: Sonnet input=?/MTok, output=?/MTok
 const COST_PER_INPUT_TOKEN = 3 / 1000000;
 const COST_PER_OUTPUT_TOKEN = 15 / 1000000;
 const MAX_RETRIES = 2;
@@ -25,27 +25,27 @@ const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
  */
 async function loadSchemaContext(appId) {
   // Tables with enrichment — entity_name is the business-friendly name in app_tables
-  const tablesResult = await query(
+  const [tablesRows] = await query(
     `SELECT id, table_name, entity_name, description, row_count, entity_metadata
-     FROM app_tables WHERE app_id = $1 AND enrichment_status IN ('approved', 'ai_enriched')
+     FROM app_tables WHERE app_id = ? AND enrichment_status IN ('approved', 'ai_enriched')
      ORDER BY table_name`,
     [appId]
   );
 
   // Columns with enrichment — is_pk/is_fk are the actual column names
-  const columnsResult = await query(
+  const [columnsRows] = await query(
     `SELECT ac.id, ac.table_id, ac.column_name, ac.business_name, ac.description,
             ac.data_type, ac.is_pk, ac.is_fk,
             ac.value_mapping, at.table_name
      FROM app_columns ac
      JOIN app_tables at ON ac.table_id = at.id
-     WHERE at.app_id = $1 AND at.enrichment_status IN ('approved', 'ai_enriched')
+     WHERE at.app_id = ? AND at.enrichment_status IN ('approved', 'ai_enriched')
      ORDER BY at.table_name, ac.column_name`,
     [appId]
   );
 
   // Relationships — uses from_table_id/to_table_id (integer FKs), not source_table/target_table (names)
-  const relsResult = await query(
+  const [relsRows] = await query(
     `SELECT ar.id,
             ft.table_name as from_table, ar.from_column,
             tt.table_name as to_table, ar.to_column,
@@ -53,7 +53,7 @@ async function loadSchemaContext(appId) {
      FROM app_relationships ar
      JOIN app_tables ft ON ar.from_table_id = ft.id
      JOIN app_tables tt ON ar.to_table_id = tt.id
-     WHERE ar.app_id = $1 AND (ar.enrichment_status = 'approved' OR ar.enrichment_status = 'ai_enriched')
+     WHERE ar.app_id = ? AND (ar.enrichment_status = 'approved' OR ar.enrichment_status = 'ai_enriched')
      ORDER BY ar.confidence_score DESC`,
     [appId]
   );
@@ -61,20 +61,20 @@ async function loadSchemaContext(appId) {
   // Context documents (BOKG Builder's context-assisted build docs) — may not exist
   let contextDocs = [];
   try {
-    const contextResult = await query(
+    const [contextRows] = await query(
       `SELECT filename, extracted_text, description
-       FROM context_documents WHERE app_id = $1`,
+       FROM context_documents WHERE app_id = ?`,
       [appId]
     );
-    contextDocs = contextResult.rows;
+    contextDocs = contextRows;
   } catch (e) {
     // Table may not exist yet — that's fine
   }
 
   return {
-    tables: tablesResult.rows,
-    columns: columnsResult.rows,
-    relationships: relsResult.rows,
+    tables: tablesRows,
+    columns: columnsRows,
+    relationships: relsRows,
     contextDocs,
   };
 }
@@ -201,16 +201,16 @@ function schemaLink(question, tables, columns, relationships, semanticMap = {}) 
 // ─── Value Dictionary Post-Processing ───
 
 async function loadValueDictionaries(appId) {
-  const result = await query(
+  const [rows] = await query(
     `SELECT ac.column_name, ac.value_mapping, at.table_name
      FROM app_columns ac
      JOIN app_tables at ON ac.table_id = at.id
-     WHERE at.app_id = $1 AND ac.value_mapping IS NOT NULL`,
+     WHERE at.app_id = ? AND ac.value_mapping IS NOT NULL`,
     [appId]
   );
 
   const dictionaries = {};
-  for (const row of result.rows) {
+  for (const row of rows) {
     try {
       const vm = typeof row.value_mapping === 'string' ? JSON.parse(row.value_mapping) : row.value_mapping;
       if (vm && typeof vm === 'object' && Object.keys(vm).length > 0) {
@@ -246,22 +246,22 @@ function fixSQLCasing(sql, dictionaries) {
 }
 
 /**
- * Fix date function calls on TEXT columns by adding ::date cast.
+ * Fix date function calls on TEXT columns by adding  cast.
  * The DDL may say DATE but the actual PostgreSQL column might be TEXT.
- * This adds ::date casts to EXTRACT, DATE_TRUNC, and date arithmetic patterns.
+ * This adds  casts to EXTRACT, DATE_TRUNC, and date arithmetic patterns.
  */
 function fixDateCasts(sql) {
   let fixed = sql;
-  // EXTRACT(YEAR FROM t1."date") → EXTRACT(YEAR FROM t1."date"::date)
+  // EXTRACT(YEAR FROM t1."date") → EXTRACT(YEAR FROM t1."date")
   // Match column ref inside EXTRACT that is NOT already cast
   fixed = fixed.replace(
     /EXTRACT\s*\(\s*(\w+)\s+FROM\s+([\w.]*"[^"]+")(?!::)\s*\)/gi,
-    'EXTRACT($1 FROM $2::date)'
+    'EXTRACT(? FROM ?)'
   );
-  // DATE_TRUNC('year', t1."date") → DATE_TRUNC('year', t1."date"::date)
+  // DATE_TRUNC('year', t1."date") → DATE_TRUNC('year', t1."date")
   fixed = fixed.replace(
     /DATE_TRUNC\s*\(\s*('[^']+'),\s*([\w.]*"[^"]+")(?!::)\s*\)/gi,
-    'DATE_TRUNC($1, $2::date)'
+    'DATE_TRUNC(?, ?)'
   );
   return fixed;
 }
@@ -295,7 +295,7 @@ async function loadFewShotExamples(appId, question) {
   try {
     result = await query(
       `SELECT nl_query, generated_sql FROM test_queries
-       WHERE app_id = $1 AND feedback = 'thumbs_up' AND generated_sql IS NOT NULL
+       WHERE app_id = ? AND feedback = 'thumbs_up' AND generated_sql IS NOT NULL
        ORDER BY created_at DESC LIMIT 50`,
       [appId]
     );
@@ -304,11 +304,11 @@ async function loadFewShotExamples(appId, question) {
     return [];
   }
 
-  if (result.rows.length === 0) return [];
+  if (rows.length === 0) return [];
 
   // Simple keyword relevance scoring
   const qWords = question.toLowerCase().split(/\s+/).filter(w => w.length > 3);
-  const scored = result.rows.map(row => {
+  const scored = rows.map(row => {
     const ql = row.nl_query.toLowerCase();
     let score = 0;
     for (const word of qWords) {
@@ -424,7 +424,7 @@ CRITICAL RULES:
 11. IMPORTANT: When joining a header/parent table to a detail/line/child table (e.g. invoices → invoice_lines, orders → order_lines), and the user is asking about header-level data, use SELECT DISTINCT on the header columns OR use a subquery/aggregation to avoid duplicate rows caused by the one-to-many join fan-out.
 12. JOIN rules: ONLY join tables using the provided Relationships section. If no relationship connects two tables, do NOT join them. Never use ON 1=1 or cross joins. If the user's question requires data from tables that cannot be joined via known relationships, query the tables separately or use only the tables that CAN be joined.
 13. When the user asks about a concept like "account type" or "loan type", look for the closest matching column in the schema (e.g., "frequency", "status", "type"). Use column descriptions and business names to make the best match.
-14. Date handling: ALWAYS cast date columns using ::date or ::timestamp before date functions like EXTRACT, DATE_TRUNC, or date arithmetic. Example: EXTRACT(YEAR FROM t1."date"::date). This is required because some date columns may be stored as TEXT in the underlying database even if typed as DATE in the schema. Safe to do on actual DATE columns too (no-op cast).`;
+14. Date handling: ALWAYS cast date columns using  or  before date functions like EXTRACT, DATE_TRUNC, or date arithmetic. Example: EXTRACT(YEAR FROM t1."date"). This is required because some date columns may be stored as TEXT in the underlying database even if typed as DATE in the schema. Safe to do on actual DATE columns too (no-op cast).`;
 
   const userMessage = `Schema:
 ${schemaDDL}
@@ -468,7 +468,7 @@ Generate the SQL query:`;
       if (attempt > 0) {
         retryHint = `\n\nPrevious SQL failed with error: ${lastError}\nPlease fix the query.`;
         if (lastError.includes('extract') && lastError.includes('text')) {
-          retryHint += '\nHINT: The date column is stored as TEXT. Use ::date cast: EXTRACT(YEAR FROM column::date)';
+          retryHint += '\nHINT: The date column is stored as TEXT. Use  cast: EXTRACT(YEAR FROM column)';
         }
       }
       const promptWithRetry = attempt > 0
@@ -493,14 +493,17 @@ Generate the SQL query:`;
       // Fix date casts — ensure EXTRACT/DATE_TRUNC on text date columns work
       sql = fixDateCasts(sql);
 
-      // Execute against the application's source data schema (appdata_{appId})
-      const schemaName = `appdata_${appId}`;
-      const dbClient = await pool.connect();
-      let execResult;
+      // Execute against the application's source data database (appdata_{appId})
+      const dbName = `appdata_${appId}`;
+      const dbClient = await pool.getConnection();
+      let execRows = [];
+      let execFields = [];
       try {
-        await dbClient.query(`SET search_path TO ${schemaName}, public`);
-        await dbClient.query('SET statement_timeout = 60000'); // 60s timeout
-        execResult = await dbClient.query(sql);
+        await dbClient.execute(`USE \`${dbName}\``);
+        await dbClient.execute('SET SESSION max_execution_time = 60000'); // 60s timeout
+        const [rows, fields] = await dbClient.execute(sql);
+        execRows = Array.isArray(rows) ? rows : [];
+        execFields = fields ? fields.map(f => f.name) : [];
       } finally {
         dbClient.release();
       }
@@ -515,9 +518,9 @@ Generate the SQL query:`;
         answer: null,  // Will be filled by the ask route with a natural language summary
         sql,
         results: {
-          rows: execResult.rows.slice(0, 100),
-          rowCount: execResult.rowCount,
-          fields: execResult.fields?.map(f => f.name) || [],
+          rows: execRows.slice(0, 100),
+          rowCount: execRows.length,
+          fields: execFields,
         },
         confidence,
         tablesUsed: relevantTables.map(t => t.table_name),

@@ -15,13 +15,13 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
 
-    const result = await query('SELECT id, email, password_hash, name, role FROM users WHERE email = $1', [email]);
+    const [rows] = await query('SELECT id, email, password_hash, name, role FROM users WHERE email = ?', [email]);
 
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const user = result.rows[0];
+    const user = rows[0];
     const passwordMatch = await bcryptjs.compare(password, user.password_hash);
 
     if (!passwordMatch) {
@@ -43,21 +43,21 @@ router.post('/login', async (req, res) => {
     let workspaces = [];
     let defaultWorkspace = null;
     try {
-      const wsResult = await query(`
+      const [wsRows] = await query(`
         SELECT w.id, w.name, w.app_id, w.description, w.is_default,
                wm.role as member_role, wm.is_default as member_default,
                a.name as app_name, a.type as app_type
         FROM workspaces w
         JOIN workspace_members wm ON w.id = wm.workspace_id
         LEFT JOIN applications a ON w.app_id = a.id
-        WHERE wm.user_id = $1
+        WHERE wm.user_id = ?
           AND wm.enabled = TRUE
           AND w.status = 'active'
           AND (wm.start_date IS NULL OR wm.start_date <= CURRENT_DATE)
           AND (wm.end_date IS NULL OR wm.end_date >= CURRENT_DATE)
         ORDER BY w.is_default DESC, wm.is_default DESC, w.name ASC
       `, [user.id]);
-      workspaces = wsResult.rows;
+      workspaces = wsRows;
       defaultWorkspace = workspaces.find(ws => ws.is_default) || workspaces[0] || null;
     } catch (wsErr) {
       // Workspaces table may not exist yet — graceful fallback
@@ -91,19 +91,20 @@ router.post('/register', async (req, res) => {
     }
 
     // Check if user already exists
-    const existing = await query('SELECT id FROM users WHERE email = $1', [email]);
-    if (existing.rows.length > 0) {
+    const [existingRows] = await query('SELECT id FROM users WHERE email = ?', [email]);
+    if (existingRows.length > 0) {
       return res.status(409).json({ error: 'User already exists' });
     }
 
     const passwordHash = await bcryptjs.hash(password, 10);
 
-    const result = await query(
-      'INSERT INTO users (email, password_hash, name, role, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, email, name, role',
+    const [result] = await query(
+      'INSERT INTO users (email, password_hash, name, role, created_at) VALUES (?, ?, ?, ?, NOW())',
       [email, passwordHash, name, 'user']
     );
 
-    const user = result.rows[0];
+    const [newUserRows] = await query('SELECT id, email, name, role FROM users WHERE id = ?', [result.insertId]);
+    const user = newUserRows[0];
 
     const token = jwt.sign(
       {
@@ -134,9 +135,9 @@ router.post('/register', async (req, res) => {
 // GET /api/auth/me
 router.get('/me', requireAuth, async (req, res) => {
   try {
-    const result = await query('SELECT id, email, name, role FROM users WHERE id = $1', [req.user.id]);
+    const [rows] = await query('SELECT id, email, name, role FROM users WHERE id = ?', [req.user.id]);
 
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
@@ -144,28 +145,28 @@ router.get('/me', requireAuth, async (req, res) => {
     let workspaces = [];
     let defaultWorkspace = null;
     try {
-      const wsResult = await query(`
+      const [wsRows] = await query(`
         SELECT w.id, w.name, w.app_id, w.description, w.is_default,
                wm.role as member_role, wm.is_default as member_default,
                a.name as app_name, a.type as app_type
         FROM workspaces w
         JOIN workspace_members wm ON w.id = wm.workspace_id
         LEFT JOIN applications a ON w.app_id = a.id
-        WHERE wm.user_id = $1
+        WHERE wm.user_id = ?
           AND wm.enabled = TRUE
           AND w.status = 'active'
           AND (wm.start_date IS NULL OR wm.start_date <= CURRENT_DATE)
           AND (wm.end_date IS NULL OR wm.end_date >= CURRENT_DATE)
         ORDER BY w.is_default DESC, wm.is_default DESC, w.name ASC
       `, [req.user.id]);
-      workspaces = wsResult.rows;
+      workspaces = wsRows;
       defaultWorkspace = workspaces.find(ws => ws.is_default) || workspaces[0] || null;
     } catch (wsErr) {
       console.warn('Workspace lookup skipped:', wsErr.message);
     }
 
     res.json({
-      user: result.rows[0],
+      user: rows[0],
       workspaces,
       defaultWorkspace,
     });

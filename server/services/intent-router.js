@@ -27,20 +27,20 @@ async function classifyIntent(question, { appId, workspaceId } = {}) {
 
   if (appId) {
     // Check for structured data (AKG tables)
-    const tablesResult = await query(
-      `SELECT COUNT(*) as table_count FROM app_tables WHERE app_id = $1`,
+    const [tablesRows] = await query(
+      `SELECT COUNT(*) as table_count FROM app_tables WHERE app_id = ?`,
       [appId]
     );
-    const tableCount = parseInt(tablesResult.rows[0].table_count);
+    const tableCount = parseInt(tablesRows[0].table_count);
 
     if (tableCount > 0) {
-      const sampleTables = await query(
-        `SELECT table_name, entity_name, entity_metadata->>'domain' as domain
-         FROM app_tables WHERE app_id = $1
+      const [sampleTables] = await query(
+        `SELECT table_name, entity_name, JSON_UNQUOTE(JSON_EXTRACT(entity_metadata, '$.domain')) as domain
+         FROM app_tables WHERE app_id = ?
          ORDER BY table_name LIMIT 20`,
         [appId]
       );
-      const tableList = sampleTables.rows
+      const tableList = sampleTables
         .map(t => `${t.entity_name || t.table_name} (${t.domain || 'uncategorized'})`)
         .join(', ');
       structuredContext = `${tableCount} database tables available including: ${tableList}`;
@@ -49,39 +49,39 @@ async function classifyIntent(question, { appId, workspaceId } = {}) {
 
   // Check for unstructured documents — prefer workspace scope, fall back to app scope
   if (workspaceId) {
-    const docsResult = await query(
+    const [docsRows] = await query(
       `SELECT COUNT(*) as doc_count FROM doc_sources ds
        JOIN doc_collections dc ON ds.collection_id = dc.id
-       WHERE dc.workspace_id = $1 AND ds.status = 'ready'`,
+       WHERE dc.workspace_id = ? AND ds.status = 'ready'`,
       [workspaceId]
     );
-    const docCount = parseInt(docsResult.rows[0].doc_count);
+    const docCount = parseInt(docsRows[0].doc_count);
 
     if (docCount > 0) {
-      const sampleDocs = await query(
+      const [sampleDocs] = await query(
         `SELECT ds.filename FROM doc_sources ds
          JOIN doc_collections dc ON ds.collection_id = dc.id
-         WHERE dc.workspace_id = $1 AND ds.status = 'ready'
+         WHERE dc.workspace_id = ? AND ds.status = 'ready'
          ORDER BY ds.created_at DESC LIMIT 10`,
         [workspaceId]
       );
-      const docList = sampleDocs.rows.map(d => d.filename).join(', ');
+      const docList = sampleDocs.map(d => d.filename).join(', ');
       unstructuredContext = `${docCount} documents available including: ${docList}`;
     }
   } else if (appId) {
     // Fallback: search by app_id (backward compat)
-    const docsResult = await query(
-      `SELECT COUNT(*) as doc_count FROM doc_sources WHERE app_id = $1 AND status = 'ready'`,
+    const [docsRows] = await query(
+      `SELECT COUNT(*) as doc_count FROM doc_sources WHERE app_id = ? AND status = 'ready'`,
       [appId]
     );
-    const docCount = parseInt(docsResult.rows[0].doc_count);
+    const docCount = parseInt(docsRows[0].doc_count);
 
     if (docCount > 0) {
-      const sampleDocs = await query(
-        `SELECT filename FROM doc_sources WHERE app_id = $1 AND status = 'ready' ORDER BY created_at DESC LIMIT 10`,
+      const [sampleDocs2] = await query(
+        `SELECT filename FROM doc_sources WHERE app_id = ? AND status = 'ready' ORDER BY created_at DESC LIMIT 10`,
         [appId]
       );
-      const docList = sampleDocs.rows.map(d => d.filename).join(', ');
+      const docList = sampleDocs2.map(d => d.filename).join(', ');
       unstructuredContext = `${docCount} documents available including: ${docList}`;
     }
   }

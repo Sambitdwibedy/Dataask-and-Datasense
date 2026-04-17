@@ -1,34 +1,34 @@
 /**
  * Data Loader Service - BOKG Builder
  *
- * Loads source database data into PostgreSQL for live querying and profiling.
+ * Loads source database data into MySQL for live querying and profiling.
  * Supports SQLite files (BIRD benchmark) with auto-detection of types.
  *
- * Creates a separate schema "appdata_{appId}" for each application's source data.
+ * Creates a separate database "appdata_{appId}" for each application's source data.
  */
 
 const { pool, query } = require('../db');
 const path = require('path');
 
-// Map SQLite types to PostgreSQL types
-function sqliteTypeToPg(sqliteType) {
+// Map SQLite types to MySQL types
+function sqliteTypeToMysql(sqliteType) {
   const t = (sqliteType || '').toUpperCase();
   if (t.includes('INT')) return 'BIGINT';
-  if (t.includes('REAL') || t.includes('FLOAT') || t.includes('DOUBLE')) return 'DOUBLE PRECISION';
+  if (t.includes('REAL') || t.includes('FLOAT') || t.includes('DOUBLE')) return 'DOUBLE';
   if (t.includes('DATE') || t.includes('TIME')) return 'TEXT'; // keep as text for flexibility
-  if (t.includes('BLOB')) return 'BYTEA';
+  if (t.includes('BLOB')) return 'LONGBLOB';
   return 'TEXT';
 }
 
 /**
- * Load a SQLite database into PostgreSQL as a separate schema
+ * Load a SQLite database into MySQL as a separate database
  * @param {number} appId - Application ID
  * @param {string} sqlitePath - Path to .sqlite file
  * @param {object} options - { dropExisting: false }
  * @returns {Promise<object>} Load stats
  */
-async function loadSqliteToPostgres(appId, sqlitePath, options = {}) {
-  // Dynamically import better-sqlite3 or use sqlite3
+async function loadSqliteToMysql(appId, sqlitePath, options = {}) {
+  // Dynamically import better-sqlite3 or use child_process python
   let sqlite3;
   try {
     sqlite3 = require('better-sqlite3');
@@ -45,7 +45,7 @@ async function loadSqliteToPostgres(appId, sqlitePath, options = {}) {
  * The original approach dumped ALL tables into a single JSON blob via stdout.
  * With full FND reference data (651K rows in FND_COLUMNS alone), the total
  * payload reached ~1GB — exceeding Node's 500MB maxBuffer and causing silent
- * extraction failures. FND_RESOLVED_FKS never made it into PostgreSQL, which
+ * extraction failures. FND_RESOLVED_FKS never made it into MySQL, which
  * is why Strategy 4 relationships weren't appearing despite correct SQL.
  *
  * Fix: Extract tables one-at-a-time via individual files in /tmp. Each table
@@ -55,15 +55,15 @@ async function loadSqliteToPostgres(appId, sqlitePath, options = {}) {
 async function loadSqliteViaPython(appId, sqlitePath, options = {}) {
   const { execSync } = require('child_process');
   const fs = require('fs');
-  const schemaName = `appdata_${appId}`;
+  const dbName = `appdata_${appId}`;
 
-  console.log(`Loading SQLite data into schema "${schemaName}"...`);
+  console.log(`Loading SQLite data into database "${dbName}"...`);
 
-  // Drop and recreate schema
+  // Drop and recreate database
   if (options.dropExisting) {
-    await query(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`);
+    await query(`DROP DATABASE IF EXISTS \`${dbName}\``);
   }
-  await query(`CREATE SCHEMA IF NOT EXISTS ${schemaName}`);
+  await query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\``);
 
   // Step 1: Get table list and metadata from SQLite (small payload — just names/counts/schemas)
   const listScript = `
@@ -106,7 +106,6 @@ json.dump(result, sys.stdout)
   console.log(`  Found ${tableList.length} tables in SQLite`);
 
   // Step 2: Extract each table's rows individually via file-based transfer
-  // This avoids the 500MB stdout buffer limit that killed the old single-blob approach.
   const extractOneScript = `
 import sqlite3, json, sys
 conn = sqlite3.connect(sys.argv[1])
@@ -145,12 +144,12 @@ print(len(rows))
       }
     }
 
-    // Create table in PG schema
+    // Create table in MySQL database
     const colDefs = columns
-      .map(([name, type]) => `"${name}" ${sqliteTypeToPg(type)}`)
+      .map(([name, type]) => `\`${name}\` ${sqliteTypeToMysql(type)}`)
       .join(', ');
 
-    const fullTableName = `${schemaName}."${tableName}"`;
+    const fullTableName = `\`${dbName}\`.\`${tableName}\``;
 
     await query(`DROP TABLE IF EXISTS ${fullTableName}`);
     await query(`CREATE TABLE ${fullTableName} (${colDefs})`);
@@ -175,18 +174,11 @@ print(len(rows))
         for (let i = 0; i < rows.length; i += batchSize) {
           const batch = rows.slice(i, i + batchSize);
           const placeholders = batch
-            .map(
-              (row, rowIdx) =>
-                '(' +
-                row
-                  .map((_, colIdx) => `$${rowIdx * columns.length + colIdx + 1}`)
-                  .join(', ') +
-                ')'
-            )
+            .map(row => '(' + row.map(() => '?').join(', ') + ')')
             .join(', ');
 
           const values = batch.flat();
-          const colNames = columns.map(([name]) => `"${name}"`).join(', ');
+          const colNames = columns.map(([name]) => `\`${name}\``).join(', ');
 
           await query(
             `INSERT INTO ${fullTableName} (${colNames}) VALUES ${placeholders}`,
@@ -213,9 +205,9 @@ print(len(rows))
   // Apply PK/FK info from SQLite to app_columns
   if (stats.pk_count > 0 || stats.fk_count > 0) {
     console.log(`Applying SQLite schema info: ${stats.pk_count} PKs, ${stats.fk_count} FKs...`);
-    const appTablesResult = await query('SELECT id, table_name FROM app_tables WHERE app_id = $1', [appId]);
+    const [appTablesRows] = await query('SELECT id, table_name FROM app_tables WHERE app_id = ?', [appId]);
     const appTableMap = {};
-    for (const t of appTablesResult.rows) {
+    for (const t of appTablesRows) {
       appTableMap[t.table_name.toLowerCase()] = t.id;
     }
 
@@ -225,7 +217,7 @@ print(len(rows))
       if (!tableId) continue;
       for (const pkCol of pkCols) {
         await query(
-          `UPDATE app_columns SET is_pk = true WHERE table_id = $1 AND column_name = $2`,
+          `UPDATE app_columns SET is_pk = 1 WHERE table_id = ? AND column_name = ?`,
           [tableId, pkCol]
         );
       }
@@ -237,7 +229,7 @@ print(len(rows))
       if (!tableId) continue;
       const fkRef = `${fk.to_table}.${fk.to_col}`;
       await query(
-        `UPDATE app_columns SET is_fk = true, fk_reference = $1 WHERE table_id = $2 AND column_name = $3`,
+        `UPDATE app_columns SET is_fk = 1, fk_reference = ? WHERE table_id = ? AND column_name = ?`,
         [fkRef, tableId, fk.from_col]
       );
       console.log(`  FK: ${fk.from_table}.${fk.from_col} → ${fk.to_table}.${fk.to_col}`);
@@ -245,7 +237,7 @@ print(len(rows))
   }
 
   console.log(
-    `✓ Schema "${schemaName}" loaded: ${stats.tables} tables, ${stats.rows.toLocaleString()} rows, ${stats.fk_count} FKs`
+    `✓ Database "${dbName}" loaded: ${stats.tables} tables, ${stats.rows.toLocaleString()} rows, ${stats.fk_count} FKs`
   );
   return stats;
 }
@@ -253,26 +245,24 @@ print(len(rows))
 /**
  * Profile a table: sample rows, compute value dictionaries, detect patterns
  * @param {number} appId - Application ID
- * @param {string} tableName - Table name in source data schema
+ * @param {string} tableName - Table name in source data database
  * @param {string[]} columns - Column names
  * @param {number} [sampleRowCount=10] - Number of sample rows to include in profile
  * @returns {Promise<object>} Profile data with samples and value dictionaries
  */
 async function profileTable(appId, tableName, columns, sampleRowCount = 10) {
-  const schemaName = `appdata_${appId}`;
-  const fullTableName = `${schemaName}."${tableName}"`;
+  const dbName = `appdata_${appId}`;
+  const fullTableName = `\`${dbName}\`.\`${tableName}\``;
 
   // Get row count
-  const countResult = await query(`SELECT COUNT(*) as cnt FROM ${fullTableName}`);
-  const rowCount = parseInt(countResult.rows[0].cnt);
+  const [countRows] = await query(`SELECT COUNT(*) as cnt FROM ${fullTableName}`);
+  const rowCount = parseInt(countRows[0].cnt);
 
-  // Sample rows deterministically (consistent ordering ensures enrichment reproducibility)
-  // Use ctid as a stable row identifier — avoids ORDER BY RANDOM() which changes prompt on every run
+  // Sample rows (use LIMIT for deterministic ordering)
   const limit = Math.max(5, Math.min(100, sampleRowCount || 10));
-  const sampleResult = await query(
-    `SELECT * FROM ${fullTableName} ORDER BY ctid LIMIT ${limit}`
+  const [sampleRows] = await query(
+    `SELECT * FROM ${fullTableName} LIMIT ${limit}`
   );
-  const sampleRows = sampleResult.rows;
 
   // Per-column profiling
   const columnProfiles = {};
@@ -280,58 +270,60 @@ async function profileTable(appId, tableName, columns, sampleRowCount = 10) {
     const profile = {};
 
     // Distinct count and null rate
-    const statsResult = await query(
+    const [statsRows] = await query(
       `SELECT
-        COUNT(DISTINCT "${colName}") as distinct_count,
+        COUNT(DISTINCT \`${colName}\`) as distinct_count,
         COUNT(*) as total,
-        SUM(CASE WHEN "${colName}" IS NULL THEN 1 ELSE 0 END) as null_count
+        SUM(CASE WHEN \`${colName}\` IS NULL THEN 1 ELSE 0 END) as null_count
        FROM ${fullTableName}`
     );
-    const s = statsResult.rows[0];
+    const s = statsRows[0];
     profile.distinct_count = parseInt(s.distinct_count);
     profile.null_count = parseInt(s.null_count);
     profile.null_rate = rowCount > 0 ? (parseInt(s.null_count) / rowCount) : 0;
 
     // Value dictionary (top 25 distinct values with counts) for low-cardinality columns
     if (profile.distinct_count <= 50) {
-      const vdResult = await query(
-        `SELECT "${colName}" as val, COUNT(*) as cnt
+      const [vdRows] = await query(
+        `SELECT \`${colName}\` as val, COUNT(*) as cnt
          FROM ${fullTableName}
-         WHERE "${colName}" IS NOT NULL
-         GROUP BY "${colName}"
+         WHERE \`${colName}\` IS NOT NULL
+         GROUP BY \`${colName}\`
          ORDER BY cnt DESC
          LIMIT 25`
       );
       profile.value_dictionary = {};
-      vdResult.rows.forEach(r => {
+      vdRows.forEach(r => {
         profile.value_dictionary[String(r.val)] = parseInt(r.cnt);
       });
     }
 
     // Sample distinct values (up to 15)
-    const samplesResult = await query(
-      `SELECT DISTINCT "${colName}" as val
+    const [samplesRows] = await query(
+      `SELECT DISTINCT \`${colName}\` as val
        FROM ${fullTableName}
-       WHERE "${colName}" IS NOT NULL
-       ORDER BY "${colName}"
+       WHERE \`${colName}\` IS NOT NULL
+       ORDER BY \`${colName}\`
        LIMIT 15`
     );
-    profile.sample_values = samplesResult.rows.map(r => r.val);
+    profile.sample_values = samplesRows.map(r => r.val);
 
-    // Numeric stats
-    const numCheck = await query(
-      `SELECT MIN("${colName}"::numeric) as min_val, MAX("${colName}"::numeric) as max_val,
-              AVG("${colName}"::numeric) as avg_val
-       FROM ${fullTableName}
-       WHERE "${colName}" IS NOT NULL AND "${colName}" ~ '^-?[0-9]+(\\.[0-9]+)?$'`
-    ).catch(() => null);
-
-    if (numCheck && numCheck.rows[0] && numCheck.rows[0].min_val !== null) {
-      profile.is_numeric = true;
-      profile.min_value = parseFloat(numCheck.rows[0].min_val);
-      profile.max_value = parseFloat(numCheck.rows[0].max_val);
-      profile.avg_value = parseFloat(parseFloat(numCheck.rows[0].avg_val).toFixed(2));
-    }
+    // Numeric stats (try/catch — not all columns are numeric)
+    try {
+      const [numRows] = await query(
+        `SELECT MIN(\`${colName}\`) as min_val, MAX(\`${colName}\`) as max_val,
+                AVG(\`${colName}\`) as avg_val
+         FROM ${fullTableName}
+         WHERE \`${colName}\` IS NOT NULL AND \`${colName}\` REGEXP '^-?[0-9]+(\\.[0-9]+)?$'`
+      );
+      const numRow = numRows[0];
+      if (numRow && numRow.min_val !== null) {
+        profile.is_numeric = true;
+        profile.min_value = parseFloat(numRow.min_val);
+        profile.max_value = parseFloat(numRow.max_val);
+        profile.avg_value = parseFloat(parseFloat(numRow.avg_val).toFixed(2));
+      }
+    } catch {}
 
     columnProfiles[colName] = profile;
   }
@@ -345,15 +337,15 @@ async function profileTable(appId, tableName, columns, sampleRowCount = 10) {
 }
 
 /**
- * Check if source data schema exists for an app
+ * Check if source data database exists for an app
  */
 async function hasSourceData(appId) {
-  const schemaName = `appdata_${appId}`;
-  const result = await query(
-    `SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1`,
-    [schemaName]
+  const dbName = `appdata_${appId}`;
+  const [rows] = await query(
+    `SELECT schema_name FROM information_schema.SCHEMATA WHERE schema_name = ?`,
+    [dbName]
   );
-  return result.rows.length > 0;
+  return rows.length > 0;
 }
 
 /**
@@ -361,33 +353,27 @@ async function hasSourceData(appId) {
  * @param {number} appId - Application ID
  * @param {string} sql - SQL query to execute
  * @param {object} [options] - Optional settings
- * @param {number} [options.maxRows=1000] - Max rows to return (default 1000 for UI safety;
- *   pipeline internals like Strategy 4 FK resolution need higher limits since FND_RESOLVED_FKS
- *   has 25K+ rows and our business tables may not appear in the first 1000 alphabetically)
+ * @param {number} [options.maxRows=1000] - Max rows to return
  * @param {number} [options.timeout=60000] - Statement timeout in ms
  */
 async function executeOnSourceData(appId, sql, options = {}) {
   const { maxRows = 1000, timeout = 60000 } = options;
-  const schemaName = `appdata_${appId}`;
+  const dbName = `appdata_${appId}`;
 
-  // Set search_path so unqualified table names resolve to the app's schema
-  const client = await pool.connect();
+  // Use a dedicated connection to set the database context
+  const conn = await pool.getConnection();
   try {
-    await client.query(`SET search_path TO ${schemaName}, public`);
-    await client.query(`SET statement_timeout = ${timeout}`); // configurable timeout
+    await conn.execute(`USE \`${dbName}\``);
+    await conn.execute(`SET SESSION max_execution_time = ${timeout}`);
 
     const startTime = Date.now();
-    const result = await client.query(sql);
+    const [rows, fields] = await conn.execute(sql);
     const duration_ms = Date.now() - startTime;
 
-    return {
-      rows: maxRows > 0 ? result.rows.slice(0, maxRows) : result.rows,
-      row_count: result.rowCount,
-      columns: result.fields ? result.fields.map(f => f.name) : [],
-      duration_ms,
-    };
+    const resultRows = Array.isArray(rows) ? rows : [];
+    return maxRows > 0 ? resultRows.slice(0, maxRows) : resultRows;
   } finally {
-    client.release();
+    conn.release();
   }
 }
 
@@ -395,14 +381,14 @@ async function executeOnSourceData(appId, sql, options = {}) {
  * Browse table data with pagination
  */
 async function browseTable(appId, tableName, { limit = 50, offset = 0 } = {}) {
-  const schemaName = `appdata_${appId}`;
-  const fullTableName = `${schemaName}."${tableName}"`;
+  const dbName = `appdata_${appId}`;
+  const fullTableName = `\`${dbName}\`.\`${tableName}\``;
 
-  const countResult = await query(`SELECT COUNT(*) as cnt FROM ${fullTableName}`);
-  const totalRows = parseInt(countResult.rows[0].cnt);
+  const [countRows] = await query(`SELECT COUNT(*) as cnt FROM ${fullTableName}`);
+  const totalRows = parseInt(countRows[0].cnt);
 
-  const dataResult = await query(
-    `SELECT * FROM ${fullTableName} LIMIT $1 OFFSET $2`,
+  const [dataRows] = await query(
+    `SELECT * FROM ${fullTableName} LIMIT ? OFFSET ?`,
     [limit, offset]
   );
 
@@ -411,85 +397,83 @@ async function browseTable(appId, tableName, { limit = 50, offset = 0 } = {}) {
     total_rows: totalRows,
     offset,
     limit,
-    rows: dataResult.rows,
-    columns: dataResult.fields ? dataResult.fields.map(f => f.name) : [],
+    rows: dataRows,
+    columns: dataRows.length > 0 ? Object.keys(dataRows[0]) : [],
   };
 }
 
 /**
  * Sync app_columns with the actual source data schema columns.
- * Reads column names and types from the PostgreSQL information_schema and
+ * Reads column names and types from the MySQL information_schema and
  * creates/updates app_columns entries to match the real source data.
- * This ensures the BOKG context references the correct column names.
  */
 async function syncColumnsFromSource(appId) {
-  const schemaName = `appdata_${appId}`;
+  const dbName = `appdata_${appId}`;
 
-  // Get all tables in the source schema
-  const srcTables = await query(
+  // Get all tables in the source database
+  const [srcTables] = await query(
     `SELECT table_name FROM information_schema.tables
-     WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+     WHERE table_schema = ? AND table_type = 'BASE TABLE'
      ORDER BY table_name`,
-    [schemaName]
+    [dbName]
   );
 
   // Get app_tables for this app
-  const appTables = await query(
-    'SELECT id, table_name FROM app_tables WHERE app_id = $1',
+  const [appTablesRows] = await query(
+    'SELECT id, table_name FROM app_tables WHERE app_id = ?',
     [appId]
   );
   const appTableMap = {};
-  for (const t of appTables.rows) {
+  for (const t of appTablesRows) {
     appTableMap[t.table_name.toLowerCase()] = t;
   }
 
   let synced = 0;
   let created = 0;
 
-  for (const srcTable of srcTables.rows) {
+  for (const srcTable of srcTables) {
     const tableName = srcTable.table_name;
-    const appTable = appTableMap[tableName.toLowerCase()];
+    let appTable = appTableMap[tableName.toLowerCase()];
 
     if (!appTable) {
       // Auto-create app_tables entry for source tables not yet registered
-      // (needed for enterprise apps like OEBS/SAP where seed only creates the application record)
-      const insertResult = await query(
+      const [insertResult] = await query(
         `INSERT INTO app_tables (app_id, table_name, entity_name, description, enrichment_status)
-         VALUES ($1, $2, $3, '', 'draft')
-         RETURNING id, table_name`,
+         VALUES (?, ?, ?, '', 'draft')`,
         [appId, tableName, tableName]
       );
-      const newTable = insertResult.rows[0];
+      const [newTableRows] = await query('SELECT * FROM app_tables WHERE id = ?', [insertResult.insertId]);
+      const newTable = newTableRows[0];
       appTableMap[tableName.toLowerCase()] = newTable;
+      appTable = newTable;
       console.log(`  syncColumns: auto-created app_tables entry for "${tableName}" (id: ${newTable.id})`);
-      // Fall through to column sync below using the newly created entry
     }
     // Re-fetch in case we just created it
     const syncTable = appTableMap[tableName.toLowerCase()];
 
-    // Get actual columns from source schema
-    const srcCols = await query(
+    // Get actual columns from source database
+    const [srcCols] = await query(
       `SELECT column_name, data_type, ordinal_position
        FROM information_schema.columns
-       WHERE table_schema = $1 AND table_name = $2
+       WHERE table_schema = ? AND table_name = ?
        ORDER BY ordinal_position`,
-      [schemaName, tableName]
+      [dbName, tableName]
     );
 
     // Get existing app_columns for this table
-    const existingCols = await query(
-      'SELECT id, column_name FROM app_columns WHERE table_id = $1',
+    const [existingColsRows] = await query(
+      'SELECT id, column_name FROM app_columns WHERE table_id = ?',
       [syncTable.id]
     );
     const existingMap = {};
-    for (const c of existingCols.rows) {
+    for (const c of existingColsRows) {
       existingMap[c.column_name.toLowerCase()] = c;
     }
 
     // Track which app_column IDs have been matched/handled
     const handledIds = new Set();
 
-    for (const srcCol of srcCols.rows) {
+    for (const srcCol of srcCols) {
       const colName = srcCol.column_name;
       const dataType = srcCol.data_type.toUpperCase();
 
@@ -498,10 +482,10 @@ async function syncColumnsFromSource(appId) {
 
       if (existing) {
         handledIds.add(existing.id);
-        // Column exists — update name if case differs (e.g., seed had camelCase, source has snake_case)
+        // Column exists — update name if case differs
         if (existing.column_name !== colName) {
           await query(
-            'UPDATE app_columns SET column_name = $1, data_type = $2 WHERE id = $3',
+            'UPDATE app_columns SET column_name = ?, data_type = ? WHERE id = ?',
             [colName, dataType, existing.id]
           );
           console.log(`  syncColumns: renamed "${existing.column_name}" → "${colName}" in ${tableName}`);
@@ -509,7 +493,6 @@ async function syncColumnsFromSource(appId) {
         }
       } else {
         // Check if there's a camelCase variant that maps to this snake_case name
-        // e.g., seed has "accountId" but source has "account_id"
         const camelVariant = colName.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
         const existingCamel = existingMap[camelVariant.toLowerCase()];
 
@@ -517,18 +500,17 @@ async function syncColumnsFromSource(appId) {
           handledIds.add(existingCamel.id);
           // Rename the camelCase entry to match actual source column name
           await query(
-            'UPDATE app_columns SET column_name = $1, data_type = $2 WHERE id = $3',
+            'UPDATE app_columns SET column_name = ?, data_type = ? WHERE id = ?',
             [colName, dataType, existingCamel.id]
           );
           console.log(`  syncColumns: renamed "${existingCamel.column_name}" → "${colName}" in ${tableName}`);
           synced++;
         } else {
           // Column not in app_columns at all — create it
-          // Detect if it's likely a PK (first column or named *_id matching table name)
-          const isPK = colName.toLowerCase() === `${tableName.toLowerCase()}_id`;
+          const isPK = colName.toLowerCase() === `${tableName.toLowerCase()}_id` ? 1 : 0;
           await query(
             `INSERT INTO app_columns (table_id, column_name, data_type, is_pk, enrichment_status)
-             VALUES ($1, $2, $3, $4, 'draft')`,
+             VALUES (?, ?, ?, ?, 'draft')`,
             [syncTable.id, colName, dataType, isPK]
           );
           console.log(`  syncColumns: added missing column "${colName}" to ${tableName}`);
@@ -538,10 +520,9 @@ async function syncColumnsFromSource(appId) {
     }
 
     // Remove app_columns that weren't matched to any source column
-    // (These are stale entries from seed data that don't exist in the actual source)
     for (const [name, existing] of Object.entries(existingMap)) {
       if (!handledIds.has(existing.id)) {
-        await query('DELETE FROM app_columns WHERE id = $1', [existing.id]);
+        await query('DELETE FROM app_columns WHERE id = ?', [existing.id]);
         console.log(`  syncColumns: removed stale column "${existing.column_name}" from ${tableName}`);
       }
     }
@@ -552,15 +533,15 @@ async function syncColumnsFromSource(appId) {
 }
 
 /**
- * Drop source data schema for an app (used during reset)
+ * Drop source data database for an app (used during reset)
  */
 async function dropSourceData(appId) {
-  const schemaName = `appdata_${appId}`;
-  await query(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`);
+  const dbName = `appdata_${appId}`;
+  await query(`DROP DATABASE IF EXISTS \`${dbName}\``);
 }
 
 module.exports = {
-  loadSqliteToPostgres,
+  loadSqliteToMysql,
   profileTable,
   hasSourceData,
   executeOnSourceData,

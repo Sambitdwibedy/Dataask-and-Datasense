@@ -28,29 +28,28 @@ router.get('/:appId', async (req, res) => {
     const { appId } = req.params;
 
     // Check if steps exist
-    let result = await query(
-      `SELECT * FROM pipeline_steps WHERE app_id = $1 ORDER BY step_order`,
+    let [rows] = await query(
+      `SELECT * FROM pipeline_steps WHERE app_id = ? ORDER BY step_order`,
       [appId]
     );
 
     // Auto-initialize if no steps exist
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       for (const step of STEP_DEFINITIONS) {
         await query(
-          `INSERT INTO pipeline_steps (app_id, step_name, step_order, status)
-           VALUES ($1, $2, $3, 'not_started')
-           ON CONFLICT (app_id, step_name) DO NOTHING`,
+          `INSERT IGNORE INTO pipeline_steps (app_id, step_name, step_order, status)
+           VALUES (?, ?, ?, 'not_started')`,
           [appId, step.name, step.order]
         );
       }
-      result = await query(
-        `SELECT * FROM pipeline_steps WHERE app_id = $1 ORDER BY step_order`,
+      [rows] = await query(
+        `SELECT * FROM pipeline_steps WHERE app_id = ? ORDER BY step_order`,
         [appId]
       );
     }
 
     // Merge step definitions with stored state
-    const steps = result.rows.map(row => {
+    const steps = rows.map(row => {
       const def = STEP_DEFINITIONS.find(d => d.name === row.step_name) || {};
       return {
         ...row,
@@ -100,56 +99,62 @@ router.put('/:appId/:stepName', async (req, res) => {
     // Check dependency: cannot start a step if previous required step is not completed
     const stepDef = STEP_DEFINITIONS.find(d => d.name === stepName);
     if (stepDef && status === 'in_progress' && stepDef.order > 1) {
-      const prevSteps = await query(
+      const [prevSteps] = await query(
         `SELECT step_name, status FROM pipeline_steps
-         WHERE app_id = $1 AND step_order < $2 AND status NOT IN ('completed', 'skipped')
+         WHERE app_id = ? AND step_order < ? AND status NOT IN ('completed', 'skipped')
          ORDER BY step_order`,
         [appId, stepDef.order]
       );
 
       // Warn but don't block — some steps can be run out of order by advanced users
-      if (prevSteps.rows.length > 0) {
-        const incomplete = prevSteps.rows.map(r => r.step_name).join(', ');
+      if (prevSteps.length > 0) {
+        const incomplete = prevSteps.map(r => r.step_name).join(', ');
         // We'll include a warning in the response but allow proceeding
         req._stepWarning = `Previous steps not completed: ${incomplete}`;
       }
     }
 
-    const sets = ['status = $3', 'updated_at = NOW()'];
-    const params = [appId, stepName, status];
-    let idx = 4;
+    const sets = ['status = ?', 'updated_at = NOW()'];
+    const params = [status];
 
     if (status === 'in_progress') {
       sets.push(`started_at = COALESCE(started_at, NOW())`);
     }
     if (status === 'completed') {
       sets.push(`completed_at = NOW()`);
-      sets.push(`completed_by = $${idx++}`);
+      sets.push(`completed_by = ?`);
       params.push(req.user?.id || null);
     }
     if (qualityScore !== undefined) {
-      sets.push(`quality_score = $${idx++}`);
+      sets.push(`quality_score = ?`);
       params.push(qualityScore);
     }
     if (qualityDetails !== undefined) {
-      sets.push(`quality_details = $${idx++}`);
+      sets.push(`quality_details = ?`);
       params.push(JSON.stringify(qualityDetails));
     }
     if (notes !== undefined) {
-      sets.push(`notes = $${idx++}`);
+      sets.push(`notes = ?`);
       params.push(notes);
     }
 
-    const result = await query(
-      `UPDATE pipeline_steps SET ${sets.join(', ')} WHERE app_id = $1 AND step_name = $2 RETURNING *`,
+    params.push(appId);
+    params.push(stepName);
+
+    const [updateResult] = await query(
+      `UPDATE pipeline_steps SET ${sets.join(', ')} WHERE app_id = ? AND step_name = ?`,
       params
     );
 
-    if (result.rows.length === 0) {
+    if (updateResult.affectedRows === 0) {
       return res.status(404).json({ error: 'Step not found' });
     }
 
-    const response = { step: result.rows[0] };
+    const [updatedStepRows] = await query(
+      'SELECT * FROM pipeline_steps WHERE app_id = ? AND step_name = ?',
+      [appId, stepName]
+    );
+    const response = { step: updatedStepRows[0] };
     if (req._stepWarning) {
       response.warning = req._stepWarning;
     }
@@ -173,14 +178,14 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
     switch (stepName) {
       case 'load': {
         // Verify: tables and columns loaded
-        const tables = await query(`SELECT COUNT(*) as count FROM app_tables WHERE app_id = $1`, [appId]);
-        const columns = await query(
-          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = $1`,
+        const [[tablesRow]] = await query(`SELECT COUNT(*) as count FROM app_tables WHERE app_id = ?`, [appId]);
+        const [[columnsRow]] = await query(
+          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = ?`,
           [appId]
         );
         qualityDetails = {
-          tables_loaded: parseInt(tables.rows[0].count),
-          columns_loaded: parseInt(columns.rows[0].count),
+          tables_loaded: parseInt(tablesRow.count),
+          columns_loaded: parseInt(columnsRow.count),
         };
         qualityScore = qualityDetails.tables_loaded > 0 ? 100 : 0;
         break;
@@ -188,17 +193,17 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
 
       case 'profile': {
         // Verify: columns have profiling data (data_type, value_mapping)
-        const total = await query(
-          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = $1`,
+        const [[totalRow]] = await query(
+          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = ?`,
           [appId]
         );
-        const profiled = await query(
+        const [[profiledRow]] = await query(
           `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id
-           WHERE at.app_id = $1 AND (ac.data_type IS NOT NULL OR ac.value_mapping IS NOT NULL)`,
+           WHERE at.app_id = ? AND (ac.data_type IS NOT NULL OR ac.value_mapping IS NOT NULL)`,
           [appId]
         );
-        const t = parseInt(total.rows[0].count);
-        const p = parseInt(profiled.rows[0].count);
+        const t = parseInt(totalRow.count);
+        const p = parseInt(profiledRow.count);
         qualityScore = t > 0 ? Math.round((p / t) * 100) : 0;
         qualityDetails = { total_columns: t, profiled_columns: p };
         break;
@@ -206,10 +211,10 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
 
       case 'discover': {
         // Verify: relationships detected
-        const rels = await query(`SELECT COUNT(*) as count FROM app_relationships WHERE app_id = $1`, [appId]);
-        const tables = await query(`SELECT COUNT(*) as count FROM app_tables WHERE app_id = $1`, [appId]);
-        const r = parseInt(rels.rows[0].count);
-        const t = parseInt(tables.rows[0].count);
+        const [[relsRow]] = await query(`SELECT COUNT(*) as count FROM app_relationships WHERE app_id = ?`, [appId]);
+        const [[tablesRow]] = await query(`SELECT COUNT(*) as count FROM app_tables WHERE app_id = ?`, [appId]);
+        const r = parseInt(relsRow.count);
+        const t = parseInt(tablesRow.count);
         // Heuristic: expect at least (tables - 1) relationships for a connected graph
         qualityScore = t > 1 ? Math.min(100, Math.round((r / (t - 1)) * 100)) : (r > 0 ? 100 : 0);
         qualityDetails = { relationships: r, tables: t };
@@ -218,17 +223,17 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
 
       case 'enrich': {
         // Verify: columns have enrichment (business_name, description)
-        const total = await query(
-          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = $1`,
+        const [[totalRow]] = await query(
+          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = ?`,
           [appId]
         );
-        const enriched = await query(
+        const [[enrichedRow]] = await query(
           `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id
-           WHERE at.app_id = $1 AND ac.enrichment_status IN ('ai_enriched', 'approved')`,
+           WHERE at.app_id = ? AND ac.enrichment_status IN ('ai_enriched', 'approved')`,
           [appId]
         );
-        const t = parseInt(total.rows[0].count);
-        const e = parseInt(enriched.rows[0].count);
+        const t = parseInt(totalRow.count);
+        const e = parseInt(enrichedRow.count);
         qualityScore = t > 0 ? Math.round((e / t) * 100) : 0;
         qualityDetails = { total_columns: t, enriched_columns: e };
         break;
@@ -236,18 +241,18 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
 
       case 'synonyms': {
         // Verify: synonyms applied
-        const syns = await query(
+        const [[synsRow]] = await query(
           `SELECT COUNT(*) as count, COUNT(DISTINCT column_id) as columns_covered
-           FROM app_synonyms WHERE app_id = $1 AND status = 'active'`,
+           FROM app_synonyms WHERE app_id = ? AND status = 'active'`,
           [appId]
         );
-        const totalCols = await query(
-          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = $1`,
+        const [[totalColsRow]] = await query(
+          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = ?`,
           [appId]
         );
-        const s = parseInt(syns.rows[0].count);
-        const covered = parseInt(syns.rows[0].columns_covered);
-        const t = parseInt(totalCols.rows[0].count);
+        const s = parseInt(synsRow.count);
+        const covered = parseInt(synsRow.columns_covered);
+        const t = parseInt(totalColsRow.count);
         qualityScore = t > 0 ? Math.round((covered / t) * 100) : 0;
         qualityDetails = { total_synonyms: s, columns_with_synonyms: covered, total_columns: t };
         break;
@@ -255,17 +260,17 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
 
       case 'curate': {
         // Verify: human review completion
-        const total = await query(
-          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = $1`,
+        const [[totalRow]] = await query(
+          `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id WHERE at.app_id = ?`,
           [appId]
         );
-        const reviewed = await query(
+        const [[reviewedRow]] = await query(
           `SELECT COUNT(*) as count FROM app_columns ac JOIN app_tables at ON ac.table_id = at.id
-           WHERE at.app_id = $1 AND ac.enrichment_status IN ('approved', 'rejected')`,
+           WHERE at.app_id = ? AND ac.enrichment_status IN ('approved', 'rejected')`,
           [appId]
         );
-        const t = parseInt(total.rows[0].count);
-        const r = parseInt(reviewed.rows[0].count);
+        const t = parseInt(totalRow.count);
+        const r = parseInt(reviewedRow.count);
         qualityScore = t > 0 ? Math.round((r / t) * 100) : 0;
         qualityDetails = { total_columns: t, reviewed_columns: r };
         break;
@@ -273,8 +278,8 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
 
       case 'index': {
         // Verify: vector embeddings exist (check app config or embeddings table)
-        const app = await query(`SELECT config FROM applications WHERE id = $1`, [appId]);
-        const config = app.rows[0]?.config || {};
+        const [[appRow]] = await query(`SELECT config FROM applications WHERE id = ?`, [appId]);
+        const config = appRow?.config ? (typeof appRow.config === 'string' ? JSON.parse(appRow.config) : appRow.config) : {};
         const hasEmbeddings = config.embeddings_built || config.vector_index_built;
         qualityScore = hasEmbeddings ? 100 : 0;
         qualityDetails = { embeddings_built: !!hasEmbeddings };
@@ -283,21 +288,21 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
 
       case 'validate': {
         // Verify: test queries run with acceptable accuracy
-        const tests = await query(
+        const [[testsRow]] = await query(
           `SELECT COUNT(*) as total,
-                  COUNT(CASE WHEN feedback = 'thumbs_up' THEN 1 END) as passed,
-                  COUNT(CASE WHEN feedback = 'thumbs_down' THEN 1 END) as failed
-           FROM test_queries WHERE app_id = $1`,
+                  SUM(CASE WHEN feedback = 'thumbs_up' THEN 1 ELSE 0 END) as passed,
+                  SUM(CASE WHEN feedback = 'thumbs_down' THEN 1 ELSE 0 END) as failed
+           FROM test_queries WHERE app_id = ?`,
           [appId]
         );
-        const t = parseInt(tests.rows[0].total);
-        const p = parseInt(tests.rows[0].passed);
+        const t = parseInt(testsRow.total);
+        const p = parseInt(testsRow.passed);
         qualityScore = t > 0 ? Math.round((p / t) * 100) : 0;
         qualityDetails = {
           total_tests: t,
           passed: p,
-          failed: parseInt(tests.rows[0].failed),
-          unrated: t - p - parseInt(tests.rows[0].failed),
+          failed: parseInt(testsRow.failed),
+          unrated: t - p - parseInt(testsRow.failed),
         };
         break;
       }
@@ -310,8 +315,8 @@ router.post('/:appId/:stepName/verify', async (req, res) => {
     // Save quality score to the step
     if (qualityScore !== null) {
       await query(
-        `UPDATE pipeline_steps SET quality_score = $1, quality_details = $2, updated_at = NOW()
-         WHERE app_id = $3 AND step_name = $4`,
+        `UPDATE pipeline_steps SET quality_score = ?, quality_details = ?, updated_at = NOW()
+         WHERE app_id = ? AND step_name = ?`,
         [qualityScore, JSON.stringify(qualityDetails), appId, stepName]
       );
     }
@@ -335,21 +340,15 @@ router.post('/:appId/reset/:stepName', async (req, res) => {
       return res.status(404).json({ error: `Unknown step: ${stepName}` });
     }
 
-    let resetCondition = `step_name = $2`;
-    if (cascade) {
-      resetCondition = `step_order >= $2`;
-    }
-
-    const result = await query(
+    const [resetResult] = await query(
       `UPDATE pipeline_steps
        SET status = 'not_started', quality_score = NULL, quality_details = '{}',
            started_at = NULL, completed_at = NULL, completed_by = NULL, updated_at = NOW()
-       WHERE app_id = $1 AND ${cascade ? 'step_order >= $2' : 'step_name = $2'}
-       RETURNING step_name`,
+       WHERE app_id = ? AND ${cascade ? 'step_order >= ?' : 'step_name = ?'}`,
       [appId, cascade ? stepDef.order : stepName]
     );
 
-    res.json({ reset: result.rows.map(r => r.step_name) });
+    res.json({ reset: resetResult.affectedRows });
   } catch (err) {
     console.error('Reset pipeline step error:', err);
     res.status(500).json({ error: 'Internal server error' });

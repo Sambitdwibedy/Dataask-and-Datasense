@@ -10,7 +10,7 @@ router.get('/:appId/dashboard', async (req, res) => {
 
     // Column-level stats: totals, approval status, confidence tiers
     // All columns fully qualified — both app_columns and app_tables have enrichment_status, confidence_score, description
-    const colStats = await query(
+    const [colStatsRows] = await query(
       `SELECT
         COUNT(*) as total_columns,
         COUNT(CASE WHEN ac.enrichment_status = 'approved' THEN 1 END) as approved,
@@ -18,7 +18,7 @@ router.get('/:appId/dashboard', async (req, res) => {
         COUNT(CASE WHEN ac.enrichment_status = 'rejected' THEN 1 END) as rejected,
         COUNT(CASE WHEN ac.enrichment_status = 'draft' THEN 1 END) as draft,
         COUNT(CASE WHEN ac.enrichment_status = 'needs_review' THEN 1 END) as needs_review,
-        COALESCE(ROUND(AVG(ac.confidence_score)::numeric, 1), 0) as avg_confidence,
+        COALESCE(ROUND(AVG(ac.confidence_score), 1), 0) as avg_confidence,
         COUNT(CASE WHEN ac.confidence_score >= 90 THEN 1 END) as high_conf,
         COUNT(CASE WHEN ac.confidence_score >= 60 AND ac.confidence_score < 90 THEN 1 END) as med_conf,
         COUNT(CASE WHEN ac.confidence_score > 0 AND ac.confidence_score < 60 THEN 1 END) as low_conf,
@@ -26,76 +26,76 @@ router.get('/:appId/dashboard', async (req, res) => {
         COUNT(CASE WHEN ac.description IS NOT NULL AND ac.description != '' THEN 1 END) as has_description
       FROM app_columns ac
       JOIN app_tables at ON ac.table_id = at.id
-      WHERE at.app_id = $1`,
+      WHERE at.app_id = ?`,
       [appId]
     );
 
     // Entity/table-level stats
-    const entityStats = await query(
+    const [entityStatsRows] = await query(
       `SELECT
         COUNT(*) as total_entities,
         COUNT(CASE WHEN enrichment_status = 'approved' THEN 1 END) as approved_entities,
         COUNT(CASE WHEN enrichment_status = 'ai_enriched' THEN 1 END) as enriched_entities,
-        COUNT(CASE WHEN entity_metadata IS NOT NULL AND entity_metadata::text != '{}' AND entity_metadata::text != 'null' THEN 1 END) as has_metadata,
-        COALESCE(ROUND(AVG(confidence_score)::numeric, 1), 0) as avg_entity_confidence
+        COUNT(CASE WHEN entity_metadata IS NOT NULL AND entity_metadata != '{}' AND entity_metadata != 'null' THEN 1 END) as has_metadata,
+        COALESCE(ROUND(AVG(confidence_score), 1), 0) as avg_entity_confidence
       FROM app_tables
-      WHERE app_id = $1`,
+      WHERE app_id = ?`,
       [appId]
     );
 
     // Relationship stats (defensive — table may not have enrichment columns yet)
-    let relStats;
+    let relStatsRows;
     try {
-      relStats = await query(
+      [relStatsRows] = await query(
         `SELECT
           COUNT(*) as total_relationships,
           COUNT(CASE WHEN enrichment_status = 'approved' THEN 1 END) as approved_relationships,
           COUNT(CASE WHEN enrichment_status = 'ai_enriched' THEN 1 END) as enriched_relationships
         FROM app_relationships
-        WHERE app_id = $1`,
+        WHERE app_id = ?`,
         [appId]
       );
     } catch (e) {
       // Fallback: just count relationships without enrichment status
       try {
-        relStats = await query(
+        [relStatsRows] = await query(
           `SELECT COUNT(*) as total_relationships, 0 as approved_relationships, 0 as enriched_relationships
-           FROM app_relationships WHERE app_id = $1`,
+           FROM app_relationships WHERE app_id = ?`,
           [appId]
         );
       } catch {
-        relStats = { rows: [{ total_relationships: 0, approved_relationships: 0, enriched_relationships: 0 }] };
+        relStatsRows = [{ total_relationships: 0, approved_relationships: 0, enriched_relationships: 0 }];
       }
     }
 
-    // Domain breakdown from entity_metadata (defensive — JSONB may be null or missing)
-    let domainBreakdown;
+    // Domain breakdown from entity_metadata (defensive — JSON may be null or missing)
+    let domainBreakdownRows;
     try {
-      domainBreakdown = await query(
+      [domainBreakdownRows] = await query(
         `SELECT
           COALESCE(
             NULLIF(NULLIF(NULLIF(
-              at.entity_metadata->>'domain', 'General'), 'UNKNOWN'), ''),
+              JSON_UNQUOTE(JSON_EXTRACT(at.entity_metadata, '$.domain')), 'General'), 'UNKNOWN'), ''),
             'Unclassified'
           ) as domain,
           COUNT(DISTINCT at.id) as table_count,
           COUNT(DISTINCT ac.id) as column_count,
           COUNT(DISTINCT CASE WHEN ac.enrichment_status = 'approved' THEN ac.id END) as approved_columns,
           COUNT(DISTINCT CASE WHEN ac.enrichment_status IN ('approved', 'ai_enriched') THEN ac.id END) as enriched_columns,
-          COALESCE(ROUND(AVG(ac.confidence_score)::numeric, 1), 0) as avg_confidence
+          COALESCE(ROUND(AVG(ac.confidence_score), 1), 0) as avg_confidence
         FROM app_tables at
         LEFT JOIN app_columns ac ON at.id = ac.table_id
-        WHERE at.app_id = $1
+        WHERE at.app_id = ?
         GROUP BY domain
         ORDER BY column_count DESC`,
         [appId]
       );
     } catch {
-      domainBreakdown = { rows: [] };
+      domainBreakdownRows = [];
     }
 
     // Confidence distribution histogram (buckets of 10)
-    const confDist = await query(
+    const [confDistRows] = await query(
       `SELECT
         CASE
           WHEN ac.confidence_score >= 90 THEN '90-100'
@@ -112,55 +112,55 @@ router.get('/:appId/dashboard', async (req, res) => {
         COUNT(*) as count
       FROM app_columns ac
       JOIN app_tables at ON ac.table_id = at.id
-      WHERE at.app_id = $1 AND ac.confidence_score > 0
+      WHERE at.app_id = ? AND ac.confidence_score > 0
       GROUP BY bucket
       ORDER BY bucket DESC`,
       [appId]
     );
 
     // Recent curation activity (last 10 approvals/rejections)
-    const recentActivity = await query(
+    const [recentActivityRows] = await query(
       `SELECT ac.column_name, at.table_name, ac.enrichment_status, ac.confidence_score, ac.enriched_at
       FROM app_columns ac
       JOIN app_tables at ON ac.table_id = at.id
-      WHERE at.app_id = $1 AND ac.enrichment_status IN ('approved', 'rejected')
-      ORDER BY ac.enriched_at DESC NULLS LAST
+      WHERE at.app_id = ? AND ac.enrichment_status IN ('approved', 'rejected')
+      ORDER BY ac.enriched_at DESC
       LIMIT 10`,
       [appId]
     );
 
     // Pattern library count (defensive — table may not exist yet)
-    let patternCount;
+    let patternCountRows;
     try {
-      patternCount = await query(
-        `SELECT COUNT(*) as count FROM query_patterns WHERE app_id = $1`,
+      [patternCountRows] = await query(
+        `SELECT COUNT(*) as count FROM query_patterns WHERE app_id = ?`,
         [appId]
       );
     } catch {
-      patternCount = { rows: [{ count: 0 }] };
+      patternCountRows = [{ count: 0 }];
     }
 
     // Synonym stats
-    let synonymStats;
+    let synonymStatsRows;
     try {
-      synonymStats = await query(
+      [synonymStatsRows] = await query(
         `SELECT
-          COUNT(*) FILTER (WHERE status = 'active') as active,
-          COUNT(*) FILTER (WHERE source = 'ai_generated' AND status = 'active') as ai_generated,
-          COUNT(*) FILTER (WHERE source = 'builder_curated' AND status = 'active') as builder_curated,
-          COUNT(*) FILTER (WHERE source IN ('solix_global', 'domain_pack') AND status = 'active') as global_pack,
-          COUNT(DISTINCT column_id) FILTER (WHERE status = 'active') as columns_with_synonyms
-        FROM app_synonyms WHERE app_id = $1`,
+          SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
+          SUM(CASE WHEN source = 'ai_generated' AND status = 'active' THEN 1 ELSE 0 END) as ai_generated,
+          SUM(CASE WHEN source = 'builder_curated' AND status = 'active' THEN 1 ELSE 0 END) as builder_curated,
+          SUM(CASE WHEN source IN ('solix_global', 'domain_pack') AND status = 'active' THEN 1 ELSE 0 END) as global_pack,
+          COUNT(DISTINCT CASE WHEN status = 'active' THEN column_id END) as columns_with_synonyms
+        FROM app_synonyms WHERE app_id = ?`,
         [appId]
       );
     } catch {
-      synonymStats = { rows: [{ active: 0, ai_generated: 0, builder_curated: 0, global_pack: 0, columns_with_synonyms: 0 }] };
+      synonymStatsRows = [{ active: 0, ai_generated: 0, builder_curated: 0, global_pack: 0, columns_with_synonyms: 0 }];
     }
 
     // Compute Trust Score (weighted composite)
-    const cs = colStats.rows[0];
-    const es = entityStats.rows[0];
-    const rs = relStats.rows[0];
+    const cs = colStatsRows[0];
+    const es = entityStatsRows[0];
+    const rs = relStatsRows[0];
     const totalCols = parseInt(cs.total_columns) || 1;
     const totalEntities = parseInt(es.total_entities) || 1;
     const totalRels = parseInt(rs.total_relationships) || 1;
@@ -211,13 +211,13 @@ router.get('/:appId/dashboard', async (req, res) => {
         approved: parseInt(rs.approved_relationships),
         enriched: parseInt(rs.enriched_relationships),
       },
-      patterns: parseInt(patternCount.rows[0].count),
+      patterns: parseInt(patternCountRows[0].count),
       synonyms: {
-        active: parseInt(synonymStats.rows[0].active) || 0,
-        ai_generated: parseInt(synonymStats.rows[0].ai_generated) || 0,
-        builder_curated: parseInt(synonymStats.rows[0].builder_curated) || 0,
-        global_pack: parseInt(synonymStats.rows[0].global_pack) || 0,
-        columns_with_synonyms: parseInt(synonymStats.rows[0].columns_with_synonyms) || 0,
+        active: parseInt(synonymStatsRows[0].active) || 0,
+        ai_generated: parseInt(synonymStatsRows[0].ai_generated) || 0,
+        builder_curated: parseInt(synonymStatsRows[0].builder_curated) || 0,
+        global_pack: parseInt(synonymStatsRows[0].global_pack) || 0,
+        columns_with_synonyms: parseInt(synonymStatsRows[0].columns_with_synonyms) || 0,
       },
       trust_dimensions: {
         curation_coverage: curationCoverage,
@@ -227,9 +227,9 @@ router.get('/:appId/dashboard', async (req, res) => {
         description_coverage: descCoverage,
         avg_confidence: avgConf,
       },
-      domains: domainBreakdown.rows,
-      confidence_distribution: confDist.rows,
-      recent_activity: recentActivity.rows,
+      domains: domainBreakdownRows,
+      confidence_distribution: confDistRows,
+      recent_activity: recentActivityRows,
     });
   } catch (err) {
     console.error('Get quality dashboard error:', err.message, err.stack);
@@ -242,7 +242,7 @@ router.get('/:appId/confidence', async (req, res) => {
   try {
     const { appId } = req.params;
 
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         ac.id,
         ac.column_name,
@@ -251,19 +251,19 @@ router.get('/:appId/confidence', async (req, res) => {
         ac.enrichment_status
       FROM app_columns ac
       JOIN app_tables at ON ac.table_id = at.id
-      WHERE at.app_id = $1
+      WHERE at.app_id = ?
       ORDER BY ac.confidence_score DESC`,
       [appId]
     );
 
     const distribution = {};
-    result.rows.forEach((row) => {
+    rows.forEach((row) => {
       const score = parseFloat(row.confidence_score) || 0;
       const bucket = `${Math.floor(score / 10) * 10}-${Math.floor(score / 10) * 10 + 9}`;
       distribution[bucket] = (distribution[bucket] || 0) + 1;
     });
 
-    res.json({ columns: result.rows, distribution });
+    res.json({ columns: rows, distribution });
   } catch (err) {
     console.error('Get confidence error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -275,11 +275,11 @@ router.get('/:appId/coverage', async (req, res) => {
   try {
     const { appId } = req.params;
 
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         COALESCE(
           NULLIF(NULLIF(NULLIF(
-            at.entity_metadata->>'domain', 'General'), 'UNKNOWN'), ''),
+            JSON_UNQUOTE(JSON_EXTRACT(at.entity_metadata, '$.domain')), 'General'), 'UNKNOWN'), ''),
           'Unclassified'
         ) as domain,
         at.id as table_id,
@@ -291,13 +291,13 @@ router.get('/:appId/coverage', async (req, res) => {
         COALESCE(ROUND(100.0 * COUNT(DISTINCT CASE WHEN ac.enrichment_status = 'approved' THEN ac.id END) / NULLIF(COUNT(DISTINCT ac.id), 0), 2), 0) as coverage_percentage
       FROM app_tables at
       LEFT JOIN app_columns ac ON at.id = ac.table_id
-      WHERE at.app_id = $1
+      WHERE at.app_id = ?
       GROUP BY at.id, at.table_name, at.entity_name, at.enrichment_status, at.entity_metadata
       ORDER BY domain, at.table_name`,
       [appId]
     );
 
-    res.json({ coverage: result.rows });
+    res.json({ coverage: rows });
   } catch (err) {
     console.error('Get coverage error:', err);
     res.status(500).json({ error: 'Internal server error' });

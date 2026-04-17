@@ -16,96 +16,54 @@ const MIN_SCORE = 0.3;        // Minimum combined score to include
 // ─── Hybrid Search ───
 
 /**
- * Hybrid search: combines pgvector cosine similarity with tsvector full-text ranking.
- * Returns top-K chunks sorted by weighted combined score.
+ * Full-text search (MySQL LIKE-based fallback — no pgvector available).
+ * Returns top-K chunks matching the query text.
  */
 async function hybridSearch(questionText, { appId, workspaceId, collectionId, crossWorkspaceIds, topK = TOP_K } = {}) {
-  // 1. Embed the question
-  const questionEmbedding = await embedSingleText(questionText);
-  const embeddingStr = `[${questionEmbedding.join(',')}]`;
-
-  // 2. Build filter clause — workspace-aware with cross-workspace support
-  const conditions = [];
-  const params = [embeddingStr];
-  let paramIdx = 2;
+  // Build filter clause — workspace-aware with cross-workspace support
+  const conditions = ['dc.content LIKE ?'];
+  const params = [`%${questionText}%`];
 
   if (crossWorkspaceIds && crossWorkspaceIds.length > 0) {
     // Cross-workspace search: search across all user's assigned workspaces
-    conditions.push(`dc.workspace_id = ANY($${paramIdx})`);
-    params.push(crossWorkspaceIds);
-    paramIdx++;
+    const placeholders = crossWorkspaceIds.map(() => '?').join(', ');
+    conditions.push(`dc.workspace_id IN (${placeholders})`);
+    params.push(...crossWorkspaceIds);
   } else if (workspaceId) {
-    // Single workspace search (default)
-    conditions.push(`dc.workspace_id = $${paramIdx}`);
+    conditions.push(`dc.workspace_id = ?`);
     params.push(workspaceId);
-    paramIdx++;
   } else if (appId) {
-    // Backward compat: filter by app_id
-    conditions.push(`dc.app_id = $${paramIdx}`);
+    conditions.push(`dc.app_id = ?`);
     params.push(appId);
-    paramIdx++;
   }
 
   if (collectionId) {
-    conditions.push(`dc.collection_id = $${paramIdx}`);
+    conditions.push(`dc.collection_id = ?`);
     params.push(collectionId);
-    paramIdx++;
   }
 
-  const whereClause = conditions.length > 0
-    ? `WHERE ${conditions.join(' AND ')}`
-    : '';
-
-  // 3. Hybrid query: vector similarity + full-text rank
-  params.push(questionText);  // for ts_query
-  const tsParamIdx = paramIdx;
-  paramIdx++;
   params.push(topK);
-  const limitIdx = paramIdx;
 
-  const sql = `
-    WITH semantic AS (
-      SELECT
-        dc.id,
-        dc.source_id,
-        dc.chunk_index,
-        dc.content,
-        dc.metadata,
-        1 - (dc.embedding <=> $1::vector) AS semantic_score
-      FROM doc_chunks dc
-      ${whereClause}
-      ORDER BY dc.embedding <=> $1::vector
-      LIMIT $${limitIdx} * 2
-    ),
-    keyword AS (
-      SELECT
-        dc.id,
-        ts_rank_cd(dc.content_tsv, plainto_tsquery('english', $${tsParamIdx})) AS keyword_score
-      FROM doc_chunks dc
-      ${whereClause}
-      AND dc.content_tsv @@ plainto_tsquery('english', $${tsParamIdx})
-    )
-    SELECT
-      s.id,
-      s.source_id,
-      s.chunk_index,
-      s.content,
-      s.metadata,
-      s.semantic_score,
-      COALESCE(k.keyword_score, 0) AS keyword_score,
-      (${SEMANTIC_WEIGHT} * s.semantic_score + ${KEYWORD_WEIGHT} * COALESCE(k.keyword_score, 0)) AS combined_score,
+  const [rows] = await query(
+    `SELECT
+      dc.id,
+      dc.source_id,
+      dc.chunk_index,
+      dc.content,
+      dc.metadata,
+      1.0 AS semantic_score,
+      1.0 AS keyword_score,
+      1.0 AS combined_score,
       ds.filename,
       ds.file_type
-    FROM semantic s
-    LEFT JOIN keyword k ON s.id = k.id
-    JOIN doc_sources ds ON s.source_id = ds.id
-    WHERE (${SEMANTIC_WEIGHT} * s.semantic_score + ${KEYWORD_WEIGHT} * COALESCE(k.keyword_score, 0)) > ${MIN_SCORE}
-    ORDER BY combined_score DESC
-    LIMIT $${limitIdx}
-  `;
-
-  const result = await query(sql, params);
-  return result.rows;
+    FROM doc_chunks dc
+    JOIN doc_sources ds ON dc.source_id = ds.id
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY dc.id
+    LIMIT ?`,
+    params
+  );
+  return rows;
 }
 
 // ─── RAG Synthesis ───

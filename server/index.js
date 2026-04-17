@@ -90,28 +90,23 @@ app.get('/api/diag', async (req, res) => {
       'global_synonyms', 'app_synonyms'];
     for (const t of tables) {
       try {
-        const r = await query(`SELECT COUNT(*) as c FROM ${t}`);
-        checks[t] = parseInt(r.rows[0].c);
+        const [r] = await query(`SELECT COUNT(*) as c FROM ${t}`);
+        checks[t] = parseInt(r[0].c);
       } catch (e) {
         checks[t] = `ERROR: ${e.message.substring(0, 80)}`;
       }
     }
-    // Check pgvector
-    try {
-      await query(`SELECT 'test'::vector(3)`);
-      checks.pgvector = 'available';
-    } catch (e) {
-      checks.pgvector = `ERROR: ${e.message.substring(0, 80)}`;
-    }
+    // pgvector not available in MySQL
+    checks.pgvector = 'N/A (MySQL)';
     checks.anthropic_key = process.env.ANTHROPIC_API_KEY ? 'set' : 'MISSING';
     checks.openai_key = process.env.OPENAI_API_KEY ? 'set' : 'MISSING';
     // Check appdata schemas
     try {
-      const schemas = await query(`SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'appdata_%' ORDER BY schema_name`);
-      checks.appdata_schemas = schemas.rows.map(r => r.schema_name);
+      const [schemas] = await query(`SELECT schema_name FROM information_schema.SCHEMATA WHERE schema_name LIKE 'appdata_%' ORDER BY schema_name`);
+      checks.appdata_schemas = schemas.map(r => r.schema_name);
       for (const s of checks.appdata_schemas) {
-        const tblCount = await query(`SELECT COUNT(*) as c FROM information_schema.tables WHERE table_schema = $1`, [s]);
-        checks[`${s}_tables`] = parseInt(tblCount.rows[0].c);
+        const [tblCount] = await query(`SELECT COUNT(*) as c FROM information_schema.tables WHERE table_schema = ?`, [s]);
+        checks[`${s}_tables`] = parseInt(tblCount[0].c);
       }
     } catch (e) {
       checks.appdata_schemas = `ERROR: ${e.message.substring(0, 80)}`;
@@ -132,15 +127,15 @@ app.get('/api/test-ask', async (req, res) => {
     steps.params = { appId: appIdParam, question };
 
     // Step 1: Check app exists
-    const appResult = await dbQuery('SELECT id, name FROM applications WHERE id = $1', [appIdParam]);
-    steps.step1_app = appResult.rows[0] || 'NOT FOUND';
+    const [appRows] = await dbQuery('SELECT id, name FROM applications WHERE id = ?', [appIdParam]);
+    steps.step1_app = appRows[0] || 'NOT FOUND';
 
     // Step 2: Count tables for this app
-    const tableCount = await dbQuery(
-      `SELECT COUNT(*) as c FROM app_tables WHERE app_id = $1 AND enrichment_status IN ('approved','ai_enriched')`,
+    const [tableCount] = await dbQuery(
+      `SELECT COUNT(*) as c FROM app_tables WHERE app_id = ? AND enrichment_status IN ('approved','ai_enriched')`,
       [appIdParam]
     );
-    steps.step2_tables = parseInt(tableCount.rows[0].c);
+    steps.step2_tables = parseInt(tableCount[0].c);
 
     // Step 3: Intent classification
     try {
@@ -247,11 +242,11 @@ async function initDatabase() {
     const { query } = require('./db');
 
     const steps = [
-      { name: 'pgvector extension', sql: `CREATE EXTENSION IF NOT EXISTS vector;` },
+      { name: 'pgvector extension (skipped for MySQL)', sql: `SELECT 1` },
       { name: 'doc_collections table', sql: `
         CREATE TABLE IF NOT EXISTS doc_collections (
-          id SERIAL PRIMARY KEY,
-          app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          app_id INTEGER,
           name VARCHAR(255) NOT NULL,
           description TEXT,
           doc_count INTEGER DEFAULT 0,
@@ -259,71 +254,59 @@ async function initDatabase() {
           status VARCHAR(50) DEFAULT 'active',
           created_at TIMESTAMP DEFAULT NOW(),
           updated_at TIMESTAMP DEFAULT NOW()
-        );` },
+        )` },
       { name: 'doc_sources table', sql: `
         CREATE TABLE IF NOT EXISTS doc_sources (
-          id SERIAL PRIMARY KEY,
-          collection_id INTEGER REFERENCES doc_collections(id) ON DELETE CASCADE,
-          app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          collection_id INTEGER,
+          app_id INTEGER,
           filename VARCHAR(500) NOT NULL,
           file_type VARCHAR(50) NOT NULL,
           file_size_bytes INTEGER,
-          extracted_text TEXT,
+          extracted_text LONGTEXT,
           page_count INTEGER,
           chunk_count INTEGER DEFAULT 0,
           status VARCHAR(50) DEFAULT 'pending',
           error_message TEXT,
-          metadata JSONB DEFAULT '{}',
-          uploaded_by INTEGER REFERENCES users(id),
+          metadata JSON,
+          uploaded_by INTEGER,
           created_at TIMESTAMP DEFAULT NOW()
-        );` },
+        )` },
       { name: 'doc_chunks table', sql: `
         CREATE TABLE IF NOT EXISTS doc_chunks (
-          id SERIAL PRIMARY KEY,
-          source_id INTEGER REFERENCES doc_sources(id) ON DELETE CASCADE,
-          collection_id INTEGER REFERENCES doc_collections(id) ON DELETE CASCADE,
-          app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          source_id INTEGER,
+          collection_id INTEGER,
+          app_id INTEGER,
           chunk_index INTEGER NOT NULL,
-          content TEXT NOT NULL,
+          content LONGTEXT NOT NULL,
           content_length INTEGER,
-          embedding vector(1536),
-          metadata JSONB DEFAULT '{}',
+          embedding LONGTEXT,
+          metadata JSON,
           created_at TIMESTAMP DEFAULT NOW()
-        );` },
-      { name: 'doc_chunks indexes', sql: `
-        CREATE INDEX IF NOT EXISTS idx_doc_chunks_app_id ON doc_chunks(app_id);
-        CREATE INDEX IF NOT EXISTS idx_doc_chunks_collection_id ON doc_chunks(collection_id);` },
-      { name: 'content_tsv column', sql: `ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector;` },
-      { name: 'content_tsv GIN index', sql: `CREATE INDEX IF NOT EXISTS idx_doc_chunks_tsv ON doc_chunks USING GIN(content_tsv);` },
-      { name: 'tsvector trigger function', sql: `
-        CREATE OR REPLACE FUNCTION update_chunk_tsv() RETURNS trigger AS $$
-        BEGIN
-          NEW.content_tsv := to_tsvector('english', NEW.content);
-          RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql;` },
-      { name: 'tsvector trigger', sql: `
-        DROP TRIGGER IF EXISTS trg_doc_chunks_tsv ON doc_chunks;
-        CREATE TRIGGER trg_doc_chunks_tsv
-          BEFORE INSERT OR UPDATE OF content ON doc_chunks
-          FOR EACH ROW EXECUTE FUNCTION update_chunk_tsv();` },
+        )` },
+      { name: 'doc_chunks index app_id', sql: `CREATE INDEX IF NOT EXISTS idx_doc_chunks_app_id ON doc_chunks(app_id)` },
+      { name: 'doc_chunks index collection_id', sql: `CREATE INDEX IF NOT EXISTS idx_doc_chunks_collection_id ON doc_chunks(collection_id)` },
+      { name: 'content_tsv column (skipped)', sql: `SELECT 1` },
+      { name: 'content_tsv GIN index (skipped)', sql: `SELECT 1` },
+      { name: 'tsvector trigger (skipped)', sql: `SELECT 1` },
+      { name: 'tsvector trigger (skipped)', sql: `SELECT 1` },
       { name: 'ida_conversations table', sql: `
         CREATE TABLE IF NOT EXISTS ida_conversations (
-          id SERIAL PRIMARY KEY,
-          app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
-          user_id INTEGER REFERENCES users(id),
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          app_id INTEGER,
+          user_id INTEGER,
           session_id VARCHAR(100),
           role VARCHAR(20) NOT NULL,
-          content TEXT NOT NULL,
+          content LONGTEXT NOT NULL,
           intent VARCHAR(20),
-          response_data JSONB,
+          response_data JSON,
           confidence VARCHAR(20),
-          token_usage JSONB,
+          token_usage JSON,
           created_at TIMESTAMP DEFAULT NOW()
-        );` },
-      { name: 'ida_conversations indexes', sql: `
-        CREATE INDEX IF NOT EXISTS idx_ida_conversations_session ON ida_conversations(session_id);
-        CREATE INDEX IF NOT EXISTS idx_ida_conversations_app ON ida_conversations(app_id);` },
+        )` },
+      { name: 'ida_conversations index session', sql: `CREATE INDEX IF NOT EXISTS idx_ida_conversations_session ON ida_conversations(session_id)` },
+      { name: 'ida_conversations index app', sql: `CREATE INDEX IF NOT EXISTS idx_ida_conversations_app ON ida_conversations(app_id)` },
     ];
 
     for (const step of steps) {
@@ -339,19 +322,8 @@ async function initDatabase() {
       }
     }
 
-    // ivfflat index needs rows to work — skip if empty, create later
-    try {
-      const chunkCount = await query('SELECT COUNT(*) as c FROM doc_chunks');
-      if (parseInt(chunkCount.rows[0].c) > 100) {
-        await query(`CREATE INDEX IF NOT EXISTS idx_doc_chunks_embedding
-          ON doc_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);`);
-        console.log('  ✓ ivfflat vector index');
-      } else {
-        console.log('  ○ ivfflat index skipped (need >100 chunks first)');
-      }
-    } catch (err) {
-      console.warn(`  ⚠ ivfflat index: ${err.message.substring(0, 120)}`);
-    }
+    // ivfflat index skipped — pgvector not available in MySQL
+    console.log('  ○ ivfflat vector index skipped (MySQL — using LIKE-based fallback)');
 
     console.log('✓ Data Ask schema initialized');
   } catch (err) {
@@ -365,18 +337,18 @@ async function ensureAdminUser() {
     const bcryptjs = require('bcryptjs');
     const { query } = require('./db');
 
-    const result = await query('SELECT id, password_hash FROM users WHERE email = $1', ['mark@solix.com']);
+    const [rows] = await query('SELECT id, password_hash FROM users WHERE email = ?', ['mark@solix.com']);
 
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       const hash = await bcryptjs.hash('demo2026', 10);
       await query(
-        'INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, $4)',
+        'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)',
         ['mark@solix.com', hash, 'Mark Lee', 'admin']
       );
       console.log('✓ Admin user created with bcrypt password');
-    } else if (!result.rows[0].password_hash.startsWith('$2')) {
+    } else if (!rows[0].password_hash.startsWith('?')) {
       const hash = await bcryptjs.hash('demo2026', 10);
-      await query('UPDATE users SET password_hash = $1 WHERE email = $2', [hash, 'mark@solix.com']);
+      await query('UPDATE users SET password_hash = ? WHERE email = ?', [hash, 'mark@solix.com']);
       console.log('✓ Admin user password hash migrated to bcrypt');
     } else {
       console.log('✓ Admin user OK');
@@ -392,17 +364,17 @@ async function ensureEndUser() {
     const bcryptjs = require('bcryptjs');
     const { query } = require('./db');
 
-    const result = await query('SELECT id FROM users WHERE email = $1', ['analyst@solix.com']);
+    const [rows] = await query('SELECT id FROM users WHERE email = ?', ['analyst@solix.com']);
 
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       const hash = await bcryptjs.hash('demo2026', 10);
       await query(
-        'INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, $4)',
+        'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)',
         ['analyst@solix.com', hash, 'Mark Lee', 'end_user']
       );
       console.log('✓ End-user demo account created (analyst@solix.com)');
     } else {
-      await query('UPDATE users SET role = $1, name = $2 WHERE email = $3', ['end_user', 'Mark Lee', 'analyst@solix.com']);
+      await query('UPDATE users SET role = ?, name = ? WHERE email = ?', ['end_user', 'Mark Lee', 'analyst@solix.com']);
       console.log('✓ End-user demo account OK');
     }
   } catch (err) {
@@ -417,7 +389,7 @@ async function runMigrations() {
 
     // Add token_usage table
     await dbQuery(`CREATE TABLE IF NOT EXISTS token_usage (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
       pipeline_run_id INTEGER REFERENCES pipeline_runs(id) ON DELETE CASCADE,
       stage VARCHAR(50) NOT NULL,
@@ -426,60 +398,51 @@ async function runMigrations() {
       output_tokens INTEGER DEFAULT 0,
       total_tokens INTEGER DEFAULT 0,
       model VARCHAR(100),
-      cost_estimate NUMERIC(10,6) DEFAULT 0,
+      cost_estimate DECIMAL(10,6) DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_token_usage_app ON token_usage(app_id)');
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_token_usage_run ON token_usage(pipeline_run_id)');
 
-    // Add entity_metadata JSONB column to app_tables
-    await dbQuery(`DO $$ BEGIN
-      ALTER TABLE app_tables ADD COLUMN IF NOT EXISTS entity_metadata JSONB DEFAULT '{}';
-    EXCEPTION WHEN duplicate_column THEN NULL;
-    END $$`);
+    // Add entity_metadata JSON column to app_tables
+    try { await dbQuery(`ALTER TABLE app_tables ADD COLUMN entity_metadata JSON DEFAULT ('{}')`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
 
     // Add entity-level approval fields to app_tables
-    await dbQuery(`DO $$ BEGIN
-      ALTER TABLE app_tables ADD COLUMN IF NOT EXISTS enrichment_status VARCHAR(50) DEFAULT 'draft';
-      ALTER TABLE app_tables ADD COLUMN IF NOT EXISTS confidence_score NUMERIC(5,2) DEFAULT 0;
-      ALTER TABLE app_tables ADD COLUMN IF NOT EXISTS enriched_by VARCHAR(50);
-      ALTER TABLE app_tables ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMP;
-    EXCEPTION WHEN duplicate_column THEN NULL;
-    END $$`);
+    try { await dbQuery(`ALTER TABLE app_tables ADD COLUMN enrichment_status VARCHAR(50) DEFAULT 'draft'`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE app_tables ADD COLUMN confidence_score DECIMAL(5,2) DEFAULT 0`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE app_tables ADD COLUMN enriched_by VARCHAR(50)`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE app_tables ADD COLUMN enriched_at TIMESTAMP`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
 
     // Add relationship approval fields to app_relationships
-    await dbQuery(`DO $$ BEGIN
-      ALTER TABLE app_relationships ADD COLUMN IF NOT EXISTS enrichment_status VARCHAR(50) DEFAULT 'ai_enriched';
-      ALTER TABLE app_relationships ADD COLUMN IF NOT EXISTS confidence_score NUMERIC(5,2) DEFAULT 80;
-      ALTER TABLE app_relationships ADD COLUMN IF NOT EXISTS enriched_by VARCHAR(50) DEFAULT 'ai';
-      ALTER TABLE app_relationships ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMP;
-    EXCEPTION WHEN duplicate_column THEN NULL;
-    END $$`);
+    try { await dbQuery(`ALTER TABLE app_relationships ADD COLUMN enrichment_status VARCHAR(50) DEFAULT 'ai_enriched'`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE app_relationships ADD COLUMN confidence_score DECIMAL(5,2) DEFAULT 80`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE app_relationships ADD COLUMN enriched_by VARCHAR(50) DEFAULT 'ai'`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE app_relationships ADD COLUMN enriched_at TIMESTAMP`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
 
     // Create context_documents table for Context-Assisted Build
     await dbQuery(`CREATE TABLE IF NOT EXISTS context_documents (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
       filename VARCHAR(255) NOT NULL,
       file_type VARCHAR(50) NOT NULL,
       file_size INTEGER DEFAULT 0,
       extracted_text TEXT,
       description TEXT,
-      metadata JSONB,
+      metadata JSON,
       uploaded_by INTEGER REFERENCES users(id),
       uploaded_at TIMESTAMP DEFAULT NOW()
     )`);
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_context_docs_app ON context_documents(app_id)');
-    await dbQuery(`ALTER TABLE context_documents ADD COLUMN IF NOT EXISTS metadata JSONB`);
+    try { await dbQuery(`ALTER TABLE context_documents ADD COLUMN metadata JSON`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
 
     // Create query_patterns table (used by quality dashboard)
     await dbQuery(`CREATE TABLE IF NOT EXISTS query_patterns (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
       pattern_name VARCHAR(255),
       pattern_type VARCHAR(50),
       sql_template TEXT,
-      tables_involved TEXT[],
+      tables_involved TEXT,
       description TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
@@ -487,13 +450,13 @@ async function runMigrations() {
 
     // Create test_queries table (for NL2SQL history + feedback)
     await dbQuery(`CREATE TABLE IF NOT EXISTS test_queries (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
       user_id INTEGER REFERENCES users(id),
       nl_query TEXT NOT NULL,
       generated_sql TEXT,
-      execution_result JSONB,
-      confidence NUMERIC(3,2) DEFAULT 0,
+      execution_result JSON,
+      confidence DECIMAL(3,2) DEFAULT 0,
       feedback VARCHAR(20),
       created_at TIMESTAMP DEFAULT NOW()
     )`);
@@ -501,26 +464,23 @@ async function runMigrations() {
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_test_queries_user ON test_queries(user_id)');
 
     // Add published_at and published_by to applications
-    await dbQuery(`DO $$ BEGIN
-      ALTER TABLE applications ADD COLUMN IF NOT EXISTS published_at TIMESTAMP;
-      ALTER TABLE applications ADD COLUMN IF NOT EXISTS published_by INTEGER REFERENCES users(id);
-    EXCEPTION WHEN duplicate_column THEN NULL;
-    END $$`);
+    try { await dbQuery(`ALTER TABLE applications ADD COLUMN published_at TIMESTAMP`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE applications ADD COLUMN published_by INTEGER REFERENCES users(id)`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
 
     // Add progress_snapshot column to pipeline_runs for resilience across restarts
-    await dbQuery(`ALTER TABLE pipeline_runs ADD COLUMN IF NOT EXISTS progress_snapshot JSONB`);
+    try { await dbQuery(`ALTER TABLE pipeline_runs ADD COLUMN progress_snapshot JSON`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
 
     // Add column_role to app_columns
-    await dbQuery(`ALTER TABLE app_columns ADD COLUMN IF NOT EXISTS column_role VARCHAR(30)`);
+    try { await dbQuery(`ALTER TABLE app_columns ADD COLUMN column_role VARCHAR(30)`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
 
     // Recover zombie runs: any runs marked 'running' in the DB but with no active process
-    const zombieRuns = await dbQuery(
+    const [zombieRuns] = await dbQuery(
       `SELECT id, app_id FROM pipeline_runs WHERE status = 'running'`
     );
-    for (const zombie of zombieRuns.rows) {
+    for (const zombie of zombieRuns) {
       console.log(`[Recovery] Marking zombie pipeline run #${zombie.id} (app ${zombie.app_id}) as failed — server restarted`);
-      const stagesResult = await dbQuery('SELECT stages FROM pipeline_runs WHERE id = $1', [zombie.id]);
-      const stages = stagesResult.rows[0]?.stages || {};
+      const [stagesRows] = await dbQuery('SELECT stages FROM pipeline_runs WHERE id = ?', [zombie.id]);
+      const stages = stagesRows[0]?.stages || {};
       const parsedStages = typeof stages === 'string' ? JSON.parse(stages) : stages;
       for (const [name, stage] of Object.entries(parsedStages)) {
         if (stage.status === 'running' || stage.status === 'awaiting_approval') {
@@ -530,45 +490,45 @@ async function runMigrations() {
         }
       }
       await dbQuery(
-        `UPDATE pipeline_runs SET status = 'failed', completed_at = NOW(), stages = $1 WHERE id = $2`,
+        `UPDATE pipeline_runs SET status = 'failed', completed_at = NOW(), stages = ? WHERE id = ?`,
         [JSON.stringify(parsedStages), zombie.id]
       );
-      await dbQuery("UPDATE applications SET status = 'profiling', updated_at = NOW() WHERE id = $1", [zombie.app_id]);
+      await dbQuery("UPDATE applications SET status = 'profiling', updated_at = NOW() WHERE id = ?", [zombie.app_id]);
     }
-    if (zombieRuns.rows.length > 0) {
-      console.log(`[Recovery] Cleaned up ${zombieRuns.rows.length} zombie pipeline run(s)`);
+    if (zombieRuns.length > 0) {
+      console.log(`[Recovery] Cleaned up ${zombieRuns.length} zombie pipeline run(s)`);
     }
 
     // ── Workspace model (v0.4.0) ──
     await dbQuery(`CREATE TABLE IF NOT EXISTS workspaces (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
       description TEXT,
       app_id INTEGER REFERENCES applications(id) ON DELETE SET NULL,
-      is_default BOOLEAN DEFAULT FALSE,
+      is_default TINYINT(1) DEFAULT 0,
       status VARCHAR(50) DEFAULT 'active',
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
     await dbQuery(`CREATE TABLE IF NOT EXISTS workspace_members (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       role VARCHAR(50) DEFAULT 'reader',
-      is_default BOOLEAN DEFAULT FALSE,
-      start_date DATE DEFAULT CURRENT_DATE,
+      is_default TINYINT(1) DEFAULT 0,
+      start_date DATE DEFAULT (CURRENT_DATE),
       end_date DATE,
-      enabled BOOLEAN DEFAULT TRUE,
+      enabled TINYINT(1) DEFAULT 1,
       created_at TIMESTAMP DEFAULT NOW(),
       UNIQUE(workspace_id, user_id)
     )`);
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id)');
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_workspace_members_ws ON workspace_members(workspace_id)');
     // Add workspace_id to existing tables
-    await dbQuery(`DO $$ BEGIN ALTER TABLE doc_collections ADD COLUMN IF NOT EXISTS workspace_id INTEGER REFERENCES workspaces(id); EXCEPTION WHEN duplicate_column THEN NULL; END $$`);
-    await dbQuery(`DO $$ BEGIN ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS workspace_id INTEGER; EXCEPTION WHEN duplicate_column THEN NULL; END $$`);
-    await dbQuery(`DO $$ BEGIN ALTER TABLE ida_conversations ADD COLUMN IF NOT EXISTS workspace_id INTEGER; EXCEPTION WHEN duplicate_column THEN NULL; END $$`);
+    try { await dbQuery(`ALTER TABLE doc_collections ADD COLUMN workspace_id INTEGER REFERENCES workspaces(id)`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE doc_chunks ADD COLUMN workspace_id INTEGER`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
+    try { await dbQuery(`ALTER TABLE ida_conversations ADD COLUMN workspace_id INTEGER`) } catch(e) { if (!e.message.includes('Duplicate column')) throw e; }
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_doc_collections_ws ON doc_collections(workspace_id)');
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_doc_chunks_ws ON doc_chunks(workspace_id)');
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_conversations_ws ON ida_conversations(workspace_id)');
@@ -576,7 +536,7 @@ async function runMigrations() {
 
     // ── Synonym & Ontology Management ──
     await dbQuery(`CREATE TABLE IF NOT EXISTS global_synonyms (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       term VARCHAR(255) NOT NULL,
       canonical_name VARCHAR(255) NOT NULL,
       category VARCHAR(100),
@@ -585,19 +545,19 @@ async function runMigrations() {
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW(),
-      UNIQUE(term, canonical_name, COALESCE(domain_pack, ''))
+      UNIQUE KEY uq_global_synonyms (term, canonical_name, domain_pack)
     )`);
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_global_synonyms_term ON global_synonyms(term)');
     await dbQuery('CREATE INDEX IF NOT EXISTS idx_global_synonyms_pack ON global_synonyms(domain_pack)');
 
     await dbQuery(`CREATE TABLE IF NOT EXISTS app_synonyms (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       app_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
       column_id INTEGER,
       table_id INTEGER,
       term VARCHAR(255) NOT NULL,
       source VARCHAR(50) DEFAULT 'builder_curated',
-      confidence_score NUMERIC(5,2) DEFAULT 90,
+      confidence_score DECIMAL(5,2) DEFAULT 90,
       status VARCHAR(30) DEFAULT 'active',
       global_synonym_id INTEGER REFERENCES global_synonyms(id),
       created_by INTEGER REFERENCES users(id),
@@ -649,9 +609,8 @@ async function ensureEnterpriseApps() {
 
     for (const app of apps) {
       await dbQuery(
-        `INSERT INTO applications (name, type, description, status, config)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (name) DO NOTHING`,
+        `INSERT IGNORE INTO applications (name, type, description, status, config)
+         VALUES (?, ?, ?, ?, ?)`,
         [app.name, app.type, app.description, 'ingesting', JSON.stringify(app.config)]
       );
     }
@@ -676,18 +635,18 @@ async function importEnterpriseQPD() {
       const filePath = path.join(dataDir, file);
       if (!fs.existsSync(filePath)) continue;
 
-      const appResult = await dbQuery('SELECT id FROM applications WHERE name = $1', [appName]);
-      if (appResult.rows.length === 0) continue;
-      const appId = appResult.rows[0].id;
+      const [appRows] = await dbQuery('SELECT id FROM applications WHERE name = ?', [appName]);
+      if (appRows.length === 0) continue;
+      const appId = appRows[0].id;
 
-      const existing = await dbQuery('SELECT COUNT(*) FROM test_queries WHERE app_id = $1', [appId]);
-      if (parseInt(existing.rows[0].count) > 0) {
-        console.log(`✓ QPD already loaded for ${appName} (${existing.rows[0].count} queries)`);
+      const [existingRows] = await dbQuery('SELECT COUNT(*) as cnt FROM test_queries WHERE app_id = ?', [appId]);
+      if (parseInt(existingRows[0].cnt) > 0) {
+        console.log(`✓ QPD already loaded for ${appName} (${existingRows[0].cnt} queries)`);
         continue;
       }
 
-      const userResult = await dbQuery('SELECT id FROM users WHERE email = $1', ['mark@solix.com']);
-      const userId = userResult.rows.length > 0 ? userResult.rows[0].id : 1;
+      const [userRows] = await dbQuery('SELECT id FROM users WHERE email = ?', ['mark@solix.com']);
+      const userId = userRows.length > 0 ? userRows[0].id : 1;
 
       const questions = JSON.parse(fs.readFileSync(filePath, 'utf8'));
       let imported = 0;
@@ -695,8 +654,8 @@ async function importEnterpriseQPD() {
         if (!q.nl_query) continue;
         try {
           await dbQuery(
-            `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, feedback, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) ON CONFLICT DO NOTHING`,
+            `INSERT IGNORE INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, feedback, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
             [appId, userId, q.nl_query, q.sql_template || '',
              JSON.stringify({ source: 'prototype_import', objects: q.objects || [] }),
              0.85, 'thumbs_up']
@@ -728,23 +687,23 @@ async function importEnterpriseContext() {
       const filePath = path.join(dataDir, file);
       if (!fs.existsSync(filePath)) continue;
 
-      const appResult = await dbQuery('SELECT id FROM applications WHERE name = $1', [appName]);
-      if (appResult.rows.length === 0) continue;
-      const appId = appResult.rows[0].id;
+      const [appRows] = await dbQuery('SELECT id FROM applications WHERE name = ?', [appName]);
+      if (appRows.length === 0) continue;
+      const appId = appRows[0].id;
 
-      const existing = await dbQuery('SELECT COUNT(*) FROM context_documents WHERE app_id = $1 AND filename = $2', [appId, file]);
-      if (parseInt(existing.rows[0].count) > 0) {
+      const [existingRows] = await dbQuery('SELECT COUNT(*) as cnt FROM context_documents WHERE app_id = ? AND filename = ?', [appId, file]);
+      if (parseInt(existingRows[0].cnt) > 0) {
         console.log(`✓ Context doc already loaded for ${appName}`);
         continue;
       }
 
-      const userResult = await dbQuery('SELECT id FROM users WHERE email = $1', ['mark@solix.com']);
-      const userId = userResult.rows.length > 0 ? userResult.rows[0].id : 1;
+      const [userRows] = await dbQuery('SELECT id FROM users WHERE email = ?', ['mark@solix.com']);
+      const userId = userRows.length > 0 ? userRows[0].id : 1;
 
       const text = fs.readFileSync(filePath, 'utf8');
       await dbQuery(
         `INSERT INTO context_documents (app_id, filename, file_type, file_size, extracted_text, description, uploaded_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [appId, file, 'text/plain', text.length, text, desc, userId]
       );
       console.log(`✓ Imported context doc "${file}" for ${appName} (${text.length} chars)`);
@@ -759,9 +718,9 @@ async function patchSalesMetadata() {
   try {
     const { query: dbQuery } = require('./db');
 
-    const appResult = await dbQuery("SELECT id FROM applications WHERE name = 'Oracle E-Business Suite R12'");
-    if (appResult.rows.length === 0) return;
-    const appId = appResult.rows[0].id;
+    const [appRows] = await dbQuery("SELECT id FROM applications WHERE name = 'Oracle E-Business Suite R12'");
+    if (appRows.length === 0) return;
+    const appId = appRows[0].id;
 
     const patches = {
       'OE_ORDER_HEADERS_ALL': [
@@ -810,13 +769,13 @@ async function patchSalesMetadata() {
 
     let patchCount = 0;
     for (const [tableName, newQuestions] of Object.entries(patches)) {
-      const tableResult = await dbQuery(
-        'SELECT id, entity_metadata FROM app_tables WHERE app_id = $1 AND table_name = $2',
+      const [tableRows] = await dbQuery(
+        'SELECT id, entity_metadata FROM app_tables WHERE app_id = ? AND table_name = ?',
         [appId, tableName]
       );
-      if (tableResult.rows.length === 0) continue;
+      if (tableRows.length === 0) continue;
 
-      const row = tableResult.rows[0];
+      const row = tableRows[0];
       const meta = row.entity_metadata || {};
       const existing = meta.sample_questions || [];
 
@@ -831,7 +790,7 @@ async function patchSalesMetadata() {
       if (merged.length > existing.length) {
         meta.sample_questions = merged;
         await dbQuery(
-          'UPDATE app_tables SET entity_metadata = $1 WHERE id = $2',
+          'UPDATE app_tables SET entity_metadata = ? WHERE id = ?',
           [JSON.stringify(meta), row.id]
         );
         patchCount++;
@@ -852,148 +811,144 @@ async function seedProvenQueryTemplates() {
   try {
     const { query: dbQuery } = require('./db');
 
-    const appResult = await dbQuery("SELECT id FROM applications WHERE name = 'Oracle E-Business Suite R12'");
-    if (appResult.rows.length === 0) return;
-    const appId = appResult.rows[0].id;
+    const [appRows] = await dbQuery("SELECT id FROM applications WHERE name = 'Oracle E-Business Suite R12'");
+    if (appRows.length === 0) return;
+    const appId = appRows[0].id;
     const schema = `appdata_${appId}`;
 
     // Clean up old non-aggregated AR aging queries
     try {
       await dbQuery(
-        `DELETE FROM test_queries WHERE app_id = $1 AND nl_query ILIKE '%aging%'
-         AND generated_sql ILIKE '%TRX_NUMBER%' AND generated_sql NOT ILIKE '%GROUP BY%'`,
+        `DELETE FROM test_queries WHERE app_id = ? AND nl_query LIKE '%aging%'
+         AND generated_sql LIKE '%TRX_NUMBER%' AND generated_sql NOT LIKE '%GROUP BY%'`,
         [appId]
       );
     } catch (e) { /* ignore */ }
 
-    const schemaCheck = await dbQuery(
-      `SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1`, [schema]
+    const [schemaCheck] = await dbQuery(
+      `SELECT schema_name FROM information_schema.SCHEMATA WHERE schema_name = ?`, [schema]
     );
-    if (schemaCheck.rows.length === 0) return;
+    if (schemaCheck.length === 0) return;
 
-    const userResult = await dbQuery("SELECT id FROM users WHERE email = $1", ['mark@solix.com']);
-    const userId = userResult.rows.length > 0 ? userResult.rows[0].id : 1;
+    const [userRows] = await dbQuery("SELECT id FROM users WHERE email = ?", ['mark@solix.com']);
+    const userId = userRows.length > 0 ? userRows[0].id : 1;
 
     const templates = [
       {
         nl_query: 'What are the total bookings for this quarter?',
-        sql: `SELECT SUM(ool."ORDERED_QUANTITY" * ool."UNIT_SELLING_PRICE") AS total_bookings
-FROM ${schema}."OE_ORDER_HEADERS_ALL" ooh
-JOIN ${schema}."OE_ORDER_LINES_ALL" ool ON ooh."HEADER_ID" = ool."HEADER_ID"
-WHERE ooh."BOOKED_FLAG" = 'Y'
-  AND ool."CANCELLED_FLAG" = 'N'
-  AND ooh."BOOKED_DATE" >= DATE_TRUNC('quarter', CURRENT_DATE)
-  AND ooh."BOOKED_DATE" < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'`,
+        sql: `SELECT SUM(ool.ORDERED_QUANTITY * ool.UNIT_SELLING_PRICE) AS total_bookings
+FROM \`${schema}\`.OE_ORDER_HEADERS_ALL ooh
+JOIN \`${schema}\`.OE_ORDER_LINES_ALL ool ON ooh.HEADER_ID = ool.HEADER_ID
+WHERE ooh.BOOKED_FLAG = 'Y'
+  AND ool.CANCELLED_FLAG = 'N'
+  AND ooh.BOOKED_DATE >= DATE_FORMAT(CURDATE(), '%Y-%m-01')`,
         objects: ['Sales_Order']
       },
       {
         nl_query: 'Show me the booking trend by month for 2025',
-        sql: `SELECT SUBSTR(ooh."BOOKED_DATE"::text, 1, 7) AS month,
-  COUNT(DISTINCT ooh."HEADER_ID") AS order_count,
-  SUM(ool."ORDERED_QUANTITY" * ool."UNIT_SELLING_PRICE") AS total_booking_value
-FROM ${schema}."OE_ORDER_HEADERS_ALL" ooh
-JOIN ${schema}."OE_ORDER_LINES_ALL" ool ON ooh."HEADER_ID" = ool."HEADER_ID"
-WHERE ooh."BOOKED_FLAG" = 'Y'
-  AND ool."CANCELLED_FLAG" = 'N'
-  AND ooh."BOOKED_DATE" >= '2025-01-01'
-  AND ooh."BOOKED_DATE" < '2026-01-01'
-GROUP BY SUBSTR(ooh."BOOKED_DATE"::text, 1, 7)
+        sql: `SELECT DATE_FORMAT(ooh.BOOKED_DATE, '%Y-%m') AS month,
+  COUNT(DISTINCT ooh.HEADER_ID) AS order_count,
+  SUM(ool.ORDERED_QUANTITY * ool.UNIT_SELLING_PRICE) AS total_booking_value
+FROM \`${schema}\`.OE_ORDER_HEADERS_ALL ooh
+JOIN \`${schema}\`.OE_ORDER_LINES_ALL ool ON ooh.HEADER_ID = ool.HEADER_ID
+WHERE ooh.BOOKED_FLAG = 'Y'
+  AND ool.CANCELLED_FLAG = 'N'
+  AND ooh.BOOKED_DATE >= '2025-01-01'
+  AND ooh.BOOKED_DATE < '2026-01-01'
+GROUP BY DATE_FORMAT(ooh.BOOKED_DATE, '%Y-%m')
 ORDER BY month`,
         objects: ['Sales_Order']
       },
       {
         nl_query: 'What is the total revenue this quarter?',
-        sql: `SELECT SUM(rctl."EXTENDED_AMOUNT") AS total_revenue
-FROM ${schema}."RA_CUSTOMER_TRX_ALL" rcta
-JOIN ${schema}."RA_CUSTOMER_TRX_LINES_ALL" rctl ON rcta."CUSTOMER_TRX_ID" = rctl."CUSTOMER_TRX_ID"
-WHERE rctl."LINE_TYPE" = 'LINE'
-  AND rcta."TRX_DATE" >= DATE_TRUNC('quarter', CURRENT_DATE)
-  AND rcta."TRX_DATE" < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'`,
+        sql: `SELECT SUM(rctl.EXTENDED_AMOUNT) AS total_revenue
+FROM \`${schema}\`.RA_CUSTOMER_TRX_ALL rcta
+JOIN \`${schema}\`.RA_CUSTOMER_TRX_LINES_ALL rctl ON rcta.CUSTOMER_TRX_ID = rctl.CUSTOMER_TRX_ID
+WHERE rctl.LINE_TYPE = 'LINE'
+  AND rcta.TRX_DATE >= DATE_FORMAT(CURDATE(), '%Y-%m-01')`,
         objects: ['AR_Invoice']
       },
       {
         nl_query: 'Show me the AR aging report by customer',
         sql: `SELECT
-  aps."CUSTOMER_ID",
+  aps.CUSTOMER_ID,
   CASE
-    WHEN CURRENT_DATE - aps."DUE_DATE"::date <= 0 THEN 'Current'
-    WHEN CURRENT_DATE - aps."DUE_DATE"::date <= 30 THEN '1-30 Days'
-    WHEN CURRENT_DATE - aps."DUE_DATE"::date <= 60 THEN '31-60 Days'
-    WHEN CURRENT_DATE - aps."DUE_DATE"::date <= 90 THEN '61-90 Days'
+    WHEN DATEDIFF(CURDATE(), aps.DUE_DATE) <= 0 THEN 'Current'
+    WHEN DATEDIFF(CURDATE(), aps.DUE_DATE) <= 30 THEN '1-30 Days'
+    WHEN DATEDIFF(CURDATE(), aps.DUE_DATE) <= 60 THEN '31-60 Days'
+    WHEN DATEDIFF(CURDATE(), aps.DUE_DATE) <= 90 THEN '61-90 Days'
     ELSE '90+ Days'
   END AS aging_bucket,
   COUNT(*) AS invoice_count,
-  SUM(aps."AMOUNT_DUE_REMAINING") AS total_outstanding
-FROM ${schema}."AR_PAYMENT_SCHEDULES_ALL" aps
-WHERE aps."CLASS" = 'INV'
-  AND aps."AMOUNT_DUE_REMAINING" > 0
-GROUP BY aps."CUSTOMER_ID", aging_bucket
-ORDER BY aps."CUSTOMER_ID", aging_bucket`,
+  SUM(aps.AMOUNT_DUE_REMAINING) AS total_outstanding
+FROM \`${schema}\`.AR_PAYMENT_SCHEDULES_ALL aps
+WHERE aps.CLASS = 'INV'
+  AND aps.AMOUNT_DUE_REMAINING > 0
+GROUP BY aps.CUSTOMER_ID, aging_bucket
+ORDER BY aps.CUSTOMER_ID, aging_bucket`,
         objects: ['AR_Payment_Schedule']
       },
       {
         nl_query: 'What is the total booking value by sales rep?',
-        sql: `SELECT ooh."SALESREP_ID",
-  COUNT(DISTINCT ooh."HEADER_ID") AS order_count,
-  SUM(ool."ORDERED_QUANTITY" * ool."UNIT_SELLING_PRICE") AS total_booking_value
-FROM ${schema}."OE_ORDER_HEADERS_ALL" ooh
-JOIN ${schema}."OE_ORDER_LINES_ALL" ool ON ooh."HEADER_ID" = ool."HEADER_ID"
-WHERE ooh."BOOKED_FLAG" = 'Y'
-  AND ool."CANCELLED_FLAG" = 'N'
-GROUP BY ooh."SALESREP_ID"
+        sql: `SELECT ooh.SALESREP_ID,
+  COUNT(DISTINCT ooh.HEADER_ID) AS order_count,
+  SUM(ool.ORDERED_QUANTITY * ool.UNIT_SELLING_PRICE) AS total_booking_value
+FROM \`${schema}\`.OE_ORDER_HEADERS_ALL ooh
+JOIN \`${schema}\`.OE_ORDER_LINES_ALL ool ON ooh.HEADER_ID = ool.HEADER_ID
+WHERE ooh.BOOKED_FLAG = 'Y'
+  AND ool.CANCELLED_FLAG = 'N'
+GROUP BY ooh.SALESREP_ID
 ORDER BY total_booking_value DESC`,
         objects: ['Sales_Order']
       },
       {
         nl_query: 'Show me all booked orders that have not been shipped yet',
-        sql: `SELECT ooh."ORDER_NUMBER", ooh."BOOKED_DATE", ooh."SOLD_TO_ORG_ID",
-  SUM(ool."ORDERED_QUANTITY") AS total_ordered,
-  SUM(COALESCE(ool."SHIPPED_QUANTITY", 0)) AS total_shipped
-FROM ${schema}."OE_ORDER_HEADERS_ALL" ooh
-JOIN ${schema}."OE_ORDER_LINES_ALL" ool ON ooh."HEADER_ID" = ool."HEADER_ID"
-WHERE ooh."BOOKED_FLAG" = 'Y'
-  AND ooh."OPEN_FLAG" = 'Y'
-  AND ool."CANCELLED_FLAG" = 'N'
-GROUP BY ooh."ORDER_NUMBER", ooh."BOOKED_DATE", ooh."SOLD_TO_ORG_ID"
-HAVING SUM(COALESCE(ool."SHIPPED_QUANTITY", 0)) < SUM(ool."ORDERED_QUANTITY")
-ORDER BY ooh."BOOKED_DATE" DESC
+        sql: `SELECT ooh.ORDER_NUMBER, ooh.BOOKED_DATE, ooh.SOLD_TO_ORG_ID,
+  SUM(ool.ORDERED_QUANTITY) AS total_ordered,
+  SUM(COALESCE(ool.SHIPPED_QUANTITY, 0)) AS total_shipped
+FROM \`${schema}\`.OE_ORDER_HEADERS_ALL ooh
+JOIN \`${schema}\`.OE_ORDER_LINES_ALL ool ON ooh.HEADER_ID = ool.HEADER_ID
+WHERE ooh.BOOKED_FLAG = 'Y'
+  AND ooh.OPEN_FLAG = 'Y'
+  AND ool.CANCELLED_FLAG = 'N'
+GROUP BY ooh.ORDER_NUMBER, ooh.BOOKED_DATE, ooh.SOLD_TO_ORG_ID
+HAVING SUM(COALESCE(ool.SHIPPED_QUANTITY, 0)) < SUM(ool.ORDERED_QUANTITY)
+ORDER BY ooh.BOOKED_DATE DESC
 LIMIT 50`,
         objects: ['Sales_Order']
       },
       {
         nl_query: 'What is the total cash collected this quarter?',
-        sql: `SELECT SUM(acr."AMOUNT") AS total_collections
-FROM ${schema}."AR_CASH_RECEIPTS_ALL" acr
-WHERE acr."STATUS" = 'APP'
-  AND acr."RECEIPT_DATE" >= DATE_TRUNC('quarter', CURRENT_DATE)
-  AND acr."RECEIPT_DATE" < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'`,
+        sql: `SELECT SUM(acr.AMOUNT) AS total_collections
+FROM \`${schema}\`.AR_CASH_RECEIPTS_ALL acr
+WHERE acr.STATUS = 'APP'
+  AND acr.RECEIPT_DATE >= DATE_FORMAT(CURDATE(), '%Y-%m-01')`,
         objects: ['AR_Cash_Receipt']
       },
       {
         nl_query: 'Compare bookings vs revenue for the last 4 quarters',
-        sql: `WITH bookings AS (
-  SELECT DATE_TRUNC('quarter', ooh."BOOKED_DATE"::date) AS quarter,
-    SUM(ool."ORDERED_QUANTITY" * ool."UNIT_SELLING_PRICE") AS booking_value
-  FROM ${schema}."OE_ORDER_HEADERS_ALL" ooh
-  JOIN ${schema}."OE_ORDER_LINES_ALL" ool ON ooh."HEADER_ID" = ool."HEADER_ID"
-  WHERE ooh."BOOKED_FLAG" = 'Y' AND ool."CANCELLED_FLAG" = 'N'
-    AND ooh."BOOKED_DATE" >= DATE_TRUNC('quarter', CURRENT_DATE) - INTERVAL '12 months'
-  GROUP BY DATE_TRUNC('quarter', ooh."BOOKED_DATE"::date)
-),
-revenue AS (
-  SELECT DATE_TRUNC('quarter', rcta."TRX_DATE"::date) AS quarter,
-    SUM(rctl."EXTENDED_AMOUNT") AS revenue_value
-  FROM ${schema}."RA_CUSTOMER_TRX_ALL" rcta
-  JOIN ${schema}."RA_CUSTOMER_TRX_LINES_ALL" rctl ON rcta."CUSTOMER_TRX_ID" = rctl."CUSTOMER_TRX_ID"
-  WHERE rctl."LINE_TYPE" = 'LINE'
-    AND rcta."TRX_DATE" >= DATE_TRUNC('quarter', CURRENT_DATE) - INTERVAL '12 months'
-  GROUP BY DATE_TRUNC('quarter', rcta."TRX_DATE"::date)
-)
-SELECT COALESCE(b.quarter, r.quarter) AS quarter,
+        sql: `SELECT
+  COALESCE(b.quarter, r.quarter) AS quarter,
   COALESCE(b.booking_value, 0) AS bookings,
   COALESCE(r.revenue_value, 0) AS revenue
-FROM bookings b
-FULL OUTER JOIN revenue r ON b.quarter = r.quarter
+FROM (
+  SELECT DATE_FORMAT(ooh.BOOKED_DATE, '%Y-Q%q') AS quarter,
+    SUM(ool.ORDERED_QUANTITY * ool.UNIT_SELLING_PRICE) AS booking_value
+  FROM \`${schema}\`.OE_ORDER_HEADERS_ALL ooh
+  JOIN \`${schema}\`.OE_ORDER_LINES_ALL ool ON ooh.HEADER_ID = ool.HEADER_ID
+  WHERE ooh.BOOKED_FLAG = 'Y' AND ool.CANCELLED_FLAG = 'N'
+    AND ooh.BOOKED_DATE >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+  GROUP BY DATE_FORMAT(ooh.BOOKED_DATE, '%Y-Q%q')
+) b
+LEFT JOIN (
+  SELECT DATE_FORMAT(rcta.TRX_DATE, '%Y-Q%q') AS quarter,
+    SUM(rctl.EXTENDED_AMOUNT) AS revenue_value
+  FROM \`${schema}\`.RA_CUSTOMER_TRX_ALL rcta
+  JOIN \`${schema}\`.RA_CUSTOMER_TRX_LINES_ALL rctl ON rcta.CUSTOMER_TRX_ID = rctl.CUSTOMER_TRX_ID
+  WHERE rctl.LINE_TYPE = 'LINE'
+    AND rcta.TRX_DATE >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+  GROUP BY DATE_FORMAT(rcta.TRX_DATE, '%Y-Q%q')
+) r ON b.quarter = r.quarter
 ORDER BY quarter`,
         objects: ['Sales_Order', 'AR_Invoice']
       },
@@ -1001,14 +956,14 @@ ORDER BY quarter`,
 
     let seeded = 0;
     for (const t of templates) {
-      const existing = await dbQuery(
-        'SELECT id, generated_sql FROM test_queries WHERE app_id = $1 AND nl_query = $2', [appId, t.nl_query]
+      const [existing] = await dbQuery(
+        'SELECT id, generated_sql FROM test_queries WHERE app_id = ? AND nl_query = ?', [appId, t.nl_query]
       );
-      if (existing.rows.length > 0) {
-        if (existing.rows[0].generated_sql !== t.sql) {
+      if (existing.length > 0) {
+        if (existing[0].generated_sql !== t.sql) {
           await dbQuery(
-            'UPDATE test_queries SET generated_sql = $1, execution_result = $2, created_at = NOW() WHERE id = $3',
-            [t.sql, JSON.stringify({ source: 'proven_template', objects: t.objects }), existing.rows[0].id]
+            'UPDATE test_queries SET generated_sql = ?, execution_result = ?, created_at = NOW() WHERE id = ?',
+            [t.sql, JSON.stringify({ source: 'proven_template', objects: t.objects }), existing[0].id]
           );
           seeded++;
           console.log(`  ↻ Updated template: ${t.nl_query.substring(0, 50)}`);
@@ -1018,7 +973,7 @@ ORDER BY quarter`,
 
       await dbQuery(
         `INSERT INTO test_queries (app_id, user_id, nl_query, generated_sql, execution_result, confidence, feedback, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
         [appId, userId, t.nl_query, t.sql,
          JSON.stringify({ source: 'proven_template', objects: t.objects }),
          0.95, 'thumbs_up']
@@ -1040,24 +995,24 @@ async function enrichOEBSSalesData() {
   try {
     const { query: dbQuery } = require('./db');
 
-    const appResult = await dbQuery("SELECT id FROM applications WHERE name = 'Oracle E-Business Suite R12'");
-    if (appResult.rows.length === 0) return;
-    const appId = appResult.rows[0].id;
+    const [appRows] = await dbQuery("SELECT id FROM applications WHERE name = 'Oracle E-Business Suite R12'");
+    if (appRows.length === 0) return;
+    const appId = appRows[0].id;
     const schema = `appdata_${appId}`;
 
-    const schemaCheck = await dbQuery(
-      `SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1`, [schema]
+    const [schemaCheck] = await dbQuery(
+      `SELECT schema_name FROM information_schema.SCHEMATA WHERE schema_name = ?`, [schema]
     );
-    if (schemaCheck.rows.length === 0) {
+    if (schemaCheck.length === 0) {
       console.log('⏳ OEBS data schema not loaded yet — skipping sales enrichment');
       return;
     }
 
     // Check if we already enriched (sentinel: header_id 90001)
     const sentinel = await dbQuery(
-      `SELECT 1 FROM ${schema}."OE_ORDER_HEADERS_ALL" WHERE "HEADER_ID" = 90001 LIMIT 1`
+      `SELECT 1 FROM \`${schema}\`.\`OE_ORDER_HEADERS_ALL\` WHERE HEADER_ID = 90001 LIMIT 1`
     );
-    if (sentinel.rows.length > 0) {
+    if (sentinel.length > 0) {
       console.log('✓ OEBS sales data already enriched');
       return;
     }
@@ -1066,26 +1021,26 @@ async function enrichOEBSSalesData() {
 
     // Get existing reference data
     const existingCustomers = await dbQuery(
-      `SELECT DISTINCT "SOLD_TO_ORG_ID" FROM ${schema}."OE_ORDER_HEADERS_ALL" WHERE "SOLD_TO_ORG_ID" IS NOT NULL LIMIT 20`
+      `SELECT DISTINCT SOLD_TO_ORG_ID FROM \`${schema}\`.\`OE_ORDER_HEADERS_ALL\` WHERE SOLD_TO_ORG_ID IS NOT NULL LIMIT 20`
     );
-    const customerIds = existingCustomers.rows.map(r => r.SOLD_TO_ORG_ID);
+    const customerIds = existingCustomers.map(r => r.SOLD_TO_ORG_ID);
     if (customerIds.length === 0) {
       console.log('⚠ No existing customers found — skipping enrichment');
       return;
     }
 
     const existingSalesreps = await dbQuery(
-      `SELECT DISTINCT "SALESREP_ID" FROM ${schema}."OE_ORDER_HEADERS_ALL" WHERE "SALESREP_ID" IS NOT NULL LIMIT 10`
+      `SELECT DISTINCT SALESREP_ID FROM \`${schema}\`.\`OE_ORDER_HEADERS_ALL\` WHERE SALESREP_ID IS NOT NULL LIMIT 10`
     );
-    const salesrepIds = existingSalesreps.rows.map(r => r.SALESREP_ID);
+    const salesrepIds = existingSalesreps.map(r => r.SALESREP_ID);
 
     const existingItems = await dbQuery(
-      `SELECT DISTINCT "INVENTORY_ITEM_ID", "ORDERED_ITEM", "ORDER_QUANTITY_UOM", "UNIT_LIST_PRICE"
-       FROM ${schema}."OE_ORDER_LINES_ALL"
-       WHERE "INVENTORY_ITEM_ID" IS NOT NULL AND "UNIT_LIST_PRICE" IS NOT NULL
+      `SELECT DISTINCT INVENTORY_ITEM_ID, ORDERED_ITEM, ORDER_QUANTITY_UOM, UNIT_LIST_PRICE
+       FROM \`${schema}\`.\`OE_ORDER_LINES_ALL\`
+       WHERE INVENTORY_ITEM_ID IS NOT NULL AND UNIT_LIST_PRICE IS NOT NULL
        LIMIT 30`
     );
-    const items = existingItems.rows;
+    const items = existingItems;
     if (items.length === 0) {
       console.log('⚠ No existing items found — skipping enrichment');
       return;
@@ -1119,12 +1074,12 @@ async function enrichOEBSSalesData() {
         const flowStatus = isOlderMonth && Math.random() < 0.6 ? 'CLOSED' : 'BOOKED';
         const openFlag = flowStatus === 'CLOSED' ? 'N' : 'Y';
 
-        await dbQuery(`INSERT INTO ${schema}."OE_ORDER_HEADERS_ALL"
-          ("HEADER_ID", "ORDER_NUMBER", "ORDERED_DATE", "ORDER_TYPE_ID", "SOLD_TO_ORG_ID",
-           "SALESREP_ID", "TRANSACTIONAL_CURR_CODE", "BOOKED_FLAG", "BOOKED_DATE",
-           "FLOW_STATUS_CODE", "OPEN_FLAG", "CANCELLED_FLAG", "ORG_ID",
-           "CREATION_DATE", "CREATED_BY", "LAST_UPDATE_DATE", "LAST_UPDATED_BY")
-          VALUES ($1,$2,$3,1,$4,$5,'USD','Y',$6,$7,$8,'N',204,$9,1,$10,1)`,
+        await dbQuery(`INSERT INTO \`${schema}\`.\`OE_ORDER_HEADERS_ALL\`
+          (HEADER_ID, ORDER_NUMBER, ORDERED_DATE, ORDER_TYPE_ID, SOLD_TO_ORG_ID,
+           SALESREP_ID, TRANSACTIONAL_CURR_CODE, BOOKED_FLAG, BOOKED_DATE,
+           FLOW_STATUS_CODE, OPEN_FLAG, CANCELLED_FLAG, ORG_ID,
+           CREATION_DATE, CREATED_BY, LAST_UPDATE_DATE, LAST_UPDATED_BY)
+          VALUES (?,?,?,1,?,?,'USD','Y',?,?,?,'N',204,?,1,?,1)`,
           [headerId, orderNum, bookedDate, custId, repId, bookedDate,
            flowStatus, openFlag, bookedDate, bookedDate]
         );
@@ -1140,13 +1095,13 @@ async function enrichOEBSSalesData() {
           const invoicedQty = flowStatus === 'CLOSED' ? qty : 0;
           const lineStatus = flowStatus === 'CLOSED' ? 'CLOSED' : (shippedQty > 0 ? 'SHIPPED' : 'AWAITING_SHIPPING');
 
-          await dbQuery(`INSERT INTO ${schema}."OE_ORDER_LINES_ALL"
-            ("LINE_ID", "HEADER_ID", "LINE_NUMBER", "ORDERED_ITEM", "INVENTORY_ITEM_ID",
-             "ITEM_TYPE_CODE", "ORDERED_QUANTITY", "SHIPPED_QUANTITY", "INVOICED_QUANTITY",
-             "ORDER_QUANTITY_UOM", "UNIT_SELLING_PRICE", "UNIT_LIST_PRICE",
-             "LINE_CATEGORY_CODE", "FLOW_STATUS_CODE", "OPEN_FLAG", "CANCELLED_FLAG",
-             "BOOKED_FLAG", "ORG_ID", "CREATION_DATE", "CREATED_BY", "LAST_UPDATE_DATE", "LAST_UPDATED_BY")
-            VALUES ($1,$2,$3,$4,$5,'STANDARD',$6,$7,$8,$9,$10,$11,'ORDER',$12,$13,'N','Y',204,$14,1,$15,1)`,
+          await dbQuery(`INSERT INTO \`${schema}\`.\`OE_ORDER_LINES_ALL\`
+            (LINE_ID, HEADER_ID, LINE_NUMBER, ORDERED_ITEM, INVENTORY_ITEM_ID,
+             ITEM_TYPE_CODE, ORDERED_QUANTITY, SHIPPED_QUANTITY, INVOICED_QUANTITY,
+             ORDER_QUANTITY_UOM, UNIT_SELLING_PRICE, UNIT_LIST_PRICE,
+             LINE_CATEGORY_CODE, FLOW_STATUS_CODE, OPEN_FLAG, CANCELLED_FLAG,
+             BOOKED_FLAG, ORG_ID, CREATION_DATE, CREATED_BY, LAST_UPDATE_DATE, LAST_UPDATED_BY)
+            VALUES (?,?,?,?,?,'STANDARD',?,?,?,?,?,?,'ORDER',?,?,'N','Y',204,?,1,?,1)`,
             [lineIdCounter++, headerId, ln, item.ORDERED_ITEM, item.INVENTORY_ITEM_ID,
              qty, shippedQty, invoicedQty, item.ORDER_QUANTITY_UOM || 'Each',
              sellingPrice, unitPrice, lineStatus,
@@ -1167,48 +1122,48 @@ async function enrichOEBSSalesData() {
     let trxLineInserted = 0;
 
     const closedOrders = await dbQuery(
-      `SELECT h."HEADER_ID", h."ORDER_NUMBER", h."ORDERED_DATE", h."SOLD_TO_ORG_ID", h."SALESREP_ID"
-       FROM ${schema}."OE_ORDER_HEADERS_ALL" h
-       WHERE h."HEADER_ID" >= 90001 AND h."FLOW_STATUS_CODE" = 'CLOSED'`
+      `SELECT h.HEADER_ID, h.ORDER_NUMBER, h.ORDERED_DATE, h.SOLD_TO_ORG_ID, h.SALESREP_ID
+       FROM \`${schema}\`.\`OE_ORDER_HEADERS_ALL\` h
+       WHERE h.HEADER_ID >= 90001 AND h.FLOW_STATUS_CODE = 'CLOSED'`
     );
 
-    for (const order of closedOrders.rows) {
+    for (const order of closedOrders) {
       const trxId = trxIdCounter++;
       const trxDate = order.ORDERED_DATE;
       const orderDate = new Date(trxDate);
       orderDate.setDate(orderDate.getDate() + randBetween(5, 15));
       const invoiceDate = orderDate.toISOString().split('T')[0];
 
-      await dbQuery(`INSERT INTO ${schema}."RA_CUSTOMER_TRX_ALL"
-        ("CUSTOMER_TRX_ID", "TRX_NUMBER", "TRX_DATE", "CUST_TRX_TYPE_ID",
-         "BILL_TO_CUSTOMER_ID", "INVOICE_CURRENCY_CODE", "PRIMARY_SALESREP_ID",
-         "COMPLETE_FLAG", "STATUS_TRX", "ORG_ID", "CREATION_DATE", "CREATED_BY",
-         "LAST_UPDATE_DATE", "LAST_UPDATED_BY")
-        VALUES ($1,$2,$3,1,$4,'USD',$5,'Y','OP',204,$6,1,$7,1)`,
+      await dbQuery(`INSERT INTO \`${schema}\`.\`RA_CUSTOMER_TRX_ALL\`
+        (CUSTOMER_TRX_ID, TRX_NUMBER, TRX_DATE, CUST_TRX_TYPE_ID,
+         BILL_TO_CUSTOMER_ID, INVOICE_CURRENCY_CODE, PRIMARY_SALESREP_ID,
+         COMPLETE_FLAG, STATUS_TRX, ORG_ID, CREATION_DATE, CREATED_BY,
+         LAST_UPDATE_DATE, LAST_UPDATED_BY)
+        VALUES (?,?,?,1,?,'USD',?,'Y','OP',204,?,1,?,1)`,
         [trxId, `INV-${order.ORDER_NUMBER}`, invoiceDate, order.SOLD_TO_ORG_ID,
          order.SALESREP_ID, invoiceDate, invoiceDate]
       );
       trxInserted++;
 
       const orderLines = await dbQuery(
-        `SELECT "LINE_ID", "LINE_NUMBER", "ORDERED_ITEM", "INVENTORY_ITEM_ID",
-                "INVOICED_QUANTITY", "UNIT_SELLING_PRICE", "ORDER_QUANTITY_UOM"
-         FROM ${schema}."OE_ORDER_LINES_ALL"
-         WHERE "HEADER_ID" = $1`, [order.HEADER_ID]
+        `SELECT LINE_ID, LINE_NUMBER, ORDERED_ITEM, INVENTORY_ITEM_ID,
+                INVOICED_QUANTITY, UNIT_SELLING_PRICE, ORDER_QUANTITY_UOM
+         FROM \`${schema}\`.\`OE_ORDER_LINES_ALL\`
+         WHERE HEADER_ID = ?`, [order.HEADER_ID]
       );
 
-      for (const line of orderLines.rows) {
+      for (const line of orderLines) {
         const qty = line.INVOICED_QUANTITY || line.ORDERED_QUANTITY || 1;
         const price = parseFloat(line.UNIT_SELLING_PRICE) || 100;
         const extAmount = +(qty * price).toFixed(2);
 
-        await dbQuery(`INSERT INTO ${schema}."RA_CUSTOMER_TRX_LINES_ALL"
-          ("CUSTOMER_TRX_LINE_ID", "CUSTOMER_TRX_ID", "LINE_NUMBER", "LINE_TYPE",
-           "INVENTORY_ITEM_ID", "DESCRIPTION", "QUANTITY_INVOICED",
-           "UNIT_SELLING_PRICE", "EXTENDED_AMOUNT", "REVENUE_AMOUNT",
-           "UOM_CODE", "SALES_ORDER", "SALES_ORDER_LINE",
-           "CREATION_DATE", "CREATED_BY", "LAST_UPDATE_DATE", "LAST_UPDATED_BY")
-          VALUES ($1,$2,$3,'LINE',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,$14,1)`,
+        await dbQuery(`INSERT INTO \`${schema}\`.\`RA_CUSTOMER_TRX_LINES_ALL\`
+          (CUSTOMER_TRX_LINE_ID, CUSTOMER_TRX_ID, LINE_NUMBER, LINE_TYPE,
+           INVENTORY_ITEM_ID, DESCRIPTION, QUANTITY_INVOICED,
+           UNIT_SELLING_PRICE, EXTENDED_AMOUNT, REVENUE_AMOUNT,
+           UOM_CODE, SALES_ORDER, SALES_ORDER_LINE,
+           CREATION_DATE, CREATED_BY, LAST_UPDATE_DATE, LAST_UPDATED_BY)
+          VALUES (?,?,?,'LINE',?,?,?,?,?,?,?,?,?,?,1,?,1)`,
           [trxLineIdCounter++, trxId, line.LINE_NUMBER, line.INVENTORY_ITEM_ID,
            line.ORDERED_ITEM, qty, price, extAmount, extAmount,
            line.ORDER_QUANTITY_UOM || 'Each',
@@ -1220,10 +1175,10 @@ async function enrichOEBSSalesData() {
 
       // Payment schedule entry
       const totalAmount = await dbQuery(
-        `SELECT SUM("EXTENDED_AMOUNT") as total FROM ${schema}."RA_CUSTOMER_TRX_LINES_ALL"
-         WHERE "CUSTOMER_TRX_ID" = $1`, [trxId]
+        `SELECT SUM(EXTENDED_AMOUNT) as total FROM \`${schema}\`.\`RA_CUSTOMER_TRX_LINES_ALL\`
+         WHERE CUSTOMER_TRX_ID = ?`, [trxId]
       );
-      const invoiceTotal = parseFloat(totalAmount.rows[0]?.total) || 0;
+      const invoiceTotal = parseFloat(totalAmount[0]?.total) || 0;
 
       const dueDate = new Date(invoiceDate);
       dueDate.setDate(dueDate.getDate() + 30);
@@ -1234,13 +1189,13 @@ async function enrichOEBSSalesData() {
       const amountRemaining = isPaid ? 0 : invoiceTotal;
       const status = isPaid ? 'CL' : 'OP';
 
-      await dbQuery(`INSERT INTO ${schema}."AR_PAYMENT_SCHEDULES_ALL"
-        ("PAYMENT_SCHEDULE_ID", "CUSTOMER_TRX_ID", "CUSTOMER_ID", "CLASS",
-         "TRX_NUMBER", "TRX_DATE", "DUE_DATE",
-         "AMOUNT_DUE_ORIGINAL", "AMOUNT_DUE_REMAINING", "AMOUNT_APPLIED",
-         "STATUS", "INVOICE_CURRENCY_CODE", "ORG_ID",
-         "CREATION_DATE", "CREATED_BY", "LAST_UPDATE_DATE", "LAST_UPDATED_BY")
-        VALUES ($1,$2,$3,'INV',$4,$5,$6,$7,$8,$9,$10,'USD',204,$11,1,$12,1)`,
+      await dbQuery(`INSERT INTO \`${schema}\`.\`AR_PAYMENT_SCHEDULES_ALL\`
+        (PAYMENT_SCHEDULE_ID, CUSTOMER_TRX_ID, CUSTOMER_ID, CLASS,
+         TRX_NUMBER, TRX_DATE, DUE_DATE,
+         AMOUNT_DUE_ORIGINAL, AMOUNT_DUE_REMAINING, AMOUNT_APPLIED,
+         STATUS, INVOICE_CURRENCY_CODE, ORG_ID,
+         CREATION_DATE, CREATED_BY, LAST_UPDATE_DATE, LAST_UPDATED_BY)
+        VALUES (?,?,?,'INV',?,?,?,?,?,?,?,'USD',204,?,1,?,1)`,
         [trxId, trxId, order.SOLD_TO_ORG_ID,
          `INV-${order.ORDER_NUMBER}`, invoiceDate, dueDateStr,
          invoiceTotal, amountRemaining, amountApplied,
@@ -1252,12 +1207,12 @@ async function enrichOEBSSalesData() {
         receiptDate.setDate(receiptDate.getDate() + randBetween(10, 35));
         const receiptDateStr = receiptDate.toISOString().split('T')[0];
 
-        await dbQuery(`INSERT INTO ${schema}."AR_CASH_RECEIPTS_ALL"
-          ("CASH_RECEIPT_ID", "RECEIPT_NUMBER", "RECEIPT_DATE", "AMOUNT",
-           "CURRENCY_CODE", "PAY_FROM_CUSTOMER", "STATUS", "TYPE",
-           "DEPOSIT_DATE", "GL_DATE", "ORG_ID",
-           "CREATION_DATE", "CREATED_BY", "LAST_UPDATE_DATE", "LAST_UPDATED_BY")
-          VALUES ($1,$2,$3,$4,'USD',$5,'APP','STANDARD',$6,$7,204,$8,1,$9,1)`,
+        await dbQuery(`INSERT INTO \`${schema}\`.\`AR_CASH_RECEIPTS_ALL\`
+          (CASH_RECEIPT_ID, RECEIPT_NUMBER, RECEIPT_DATE, AMOUNT,
+           CURRENCY_CODE, PAY_FROM_CUSTOMER, STATUS, TYPE,
+           DEPOSIT_DATE, GL_DATE, ORG_ID,
+           CREATION_DATE, CREATED_BY, LAST_UPDATE_DATE, LAST_UPDATED_BY)
+          VALUES (?,?,?,?,'USD',?,'APP','STANDARD',?,?,204,?,1,?,1)`,
           [trxId, `RCT-${order.ORDER_NUMBER}`, receiptDateStr, invoiceTotal,
            order.SOLD_TO_ORG_ID, receiptDateStr, receiptDateStr,
            receiptDateStr, receiptDateStr]
@@ -1278,16 +1233,16 @@ async function reclassifyOFBizDomains() {
   try {
     const { query: dbQuery } = require('./db');
 
-    const appResult = await dbQuery("SELECT id FROM applications WHERE name LIKE '%OFBiz%' LIMIT 1");
-    if (appResult.rows.length === 0) return;
-    const appId = appResult.rows[0].id;
+    const [appRows] = await dbQuery("SELECT id FROM applications WHERE name LIKE '%OFBiz%' LIMIT 1");
+    if (appRows.length === 0) return;
+    const appId = appRows[0].id;
 
-    const checkResult = await dbQuery(
-      `SELECT COUNT(*) FROM app_tables WHERE app_id = $1 AND (
-        entity_metadata->>'domain' IS NULL OR entity_metadata->>'domain' = '' OR entity_metadata->>'domain' = 'Unclassified'
+    const [checkRows] = await dbQuery(
+      `SELECT COUNT(*) as cnt FROM app_tables WHERE app_id = ? AND (
+        JSON_UNQUOTE(JSON_EXTRACT(entity_metadata, '$.domain')) IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(entity_metadata, '$.domain')) = '' OR JSON_UNQUOTE(JSON_EXTRACT(entity_metadata, '$.domain')) = 'Unclassified'
       )`, [appId]
     );
-    const unclassifiedCount = parseInt(checkResult.rows[0].count);
+    const unclassifiedCount = parseInt(checkRows[0].cnt);
     if (unclassifiedCount < 50) {
       console.log(`✓ OFBiz domains OK (${unclassifiedCount} unclassified)`);
       return;
@@ -1409,11 +1364,11 @@ async function reclassifyOFBizDomains() {
       for (const ex of config.existing) nameMap[ex] = canonical;
     }
 
-    const allTables = await dbQuery('SELECT id, table_name, entity_metadata FROM app_tables WHERE app_id = $1', [appId]);
+    const [allTables] = await dbQuery('SELECT id, table_name, entity_metadata FROM app_tables WHERE app_id = ?', [appId]);
     let reclassified = 0;
     const stats = {};
 
-    for (const row of allTables.rows) {
+    for (const row of allTables) {
       const meta = typeof row.entity_metadata === 'string' ? JSON.parse(row.entity_metadata || '{}') : (row.entity_metadata || {});
       const current = (meta.domain || meta.module || 'Unclassified').toLowerCase();
       const tableName = row.table_name.toLowerCase();
@@ -1440,7 +1395,7 @@ async function reclassifyOFBizDomains() {
       if (newDomain !== oldDomain) {
         meta.domain = newDomain;
         meta._previous_domain = oldDomain;
-        await dbQuery('UPDATE app_tables SET entity_metadata = $1 WHERE id = $2', [JSON.stringify(meta), row.id]);
+        await dbQuery('UPDATE app_tables SET entity_metadata = ? WHERE id = ?', [JSON.stringify(meta), row.id]);
         reclassified++;
       }
     }
@@ -1476,9 +1431,9 @@ async function seedGlobalSynonyms() {
     const { query: dbQuery } = require('./db');
 
     // Check if already seeded
-    const existing = await dbQuery('SELECT COUNT(*) as c FROM global_synonyms');
-    if (parseInt(existing.rows[0].c) > 10) {
-      console.log(`✓ Global synonyms already seeded (${existing.rows[0].c} terms)`);
+    const [existingRows] = await dbQuery('SELECT COUNT(*) as c FROM global_synonyms');
+    if (parseInt(existingRows[0].c) > 10) {
+      console.log(`✓ Global synonyms already seeded (${existingRows[0].c} terms)`);
       return;
     }
 
@@ -1637,9 +1592,8 @@ async function seedGlobalSynonyms() {
     for (const s of healthcarePack) {
       try {
         await dbQuery(
-          `INSERT INTO global_synonyms (term, canonical_name, category, domain_pack, description)
-           VALUES ($1, $2, $3, 'healthcare', $4)
-           ON CONFLICT DO NOTHING`,
+          `INSERT IGNORE INTO global_synonyms (term, canonical_name, category, domain_pack, description)
+           VALUES (?, ?, ?, 'healthcare', ?)`,
           [s.term, s.canonical_name, s.category, `Healthcare synonym: ${s.term} → ${s.canonical_name}`]
         );
         inserted++;
@@ -1649,9 +1603,8 @@ async function seedGlobalSynonyms() {
     for (const s of globalTerms) {
       try {
         await dbQuery(
-          `INSERT INTO global_synonyms (term, canonical_name, category, domain_pack, description)
-           VALUES ($1, $2, $3, NULL, $4)
-           ON CONFLICT DO NOTHING`,
+          `INSERT IGNORE INTO global_synonyms (term, canonical_name, category, domain_pack, description)
+           VALUES (?, ?, ?, NULL, ?)`,
           [s.term, s.canonical_name, s.category, `Global synonym: ${s.term} → ${s.canonical_name}`]
         );
         inserted++;
@@ -1882,9 +1835,8 @@ async function seedGlobalSynonyms() {
     for (const s of erpPack) {
       try {
         await dbQuery(
-          `INSERT INTO global_synonyms (term, canonical_name, category, domain_pack, description)
-           VALUES ($1, $2, $3, 'erp', $4)
-           ON CONFLICT DO NOTHING`,
+          `INSERT IGNORE INTO global_synonyms (term, canonical_name, category, domain_pack, description)
+           VALUES (?, ?, ?, 'erp', ?)`,
           [s.term, s.canonical_name, s.category, `ERP synonym: ${s.term} → ${s.canonical_name}`]
         );
         erpInserted++;
@@ -1946,13 +1898,13 @@ app.listen(PORT, '0.0.0.0', async () => {
   // Verify database connectivity
   try {
     const { query } = require('./db');
-    const result = await query('SELECT COUNT(*) as app_count FROM applications');
-    console.log(`✓ Connected to shared database (${result.rows[0].app_count} applications)`);
+    const [rows] = await query('SELECT COUNT(*) as app_count FROM applications');
+    console.log(`✓ Connected to shared database (${rows[0].app_count} applications)`);
 
-    const tables = await query('SELECT COUNT(*) as c FROM app_tables');
-    const docs = await query("SELECT COUNT(*) as c FROM doc_sources WHERE status = 'ready'").catch(() => ({ rows: [{ c: 0 }] }));
-    console.log(`✓ Knowledge graph: ${tables.rows[0].c} tables`);
-    console.log(`✓ Document store: ${docs.rows[0].c} documents`);
+    const [tables] = await query('SELECT COUNT(*) as c FROM app_tables');
+    const [docs] = await query("SELECT COUNT(*) as c FROM doc_sources WHERE status = 'ready'").catch(() => [[{ c: 0 }]]);
+    console.log(`✓ Knowledge graph: ${tables[0].c} tables`);
+    console.log(`✓ Document store: ${docs[0].c} documents`);
   } catch (err) {
     console.error('⚠ Database check failed:', err.message);
   }

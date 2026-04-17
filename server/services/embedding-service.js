@@ -12,7 +12,7 @@
 const { query } = require('../db');
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const EMBEDDING_MODEL = 'text-embedding-3-small'; // 1536 dimensions, $0.02/1M tokens
+const EMBEDDING_MODEL = 'text-embedding-3-small'; // 1536 dimensions, ?.02/1M tokens
 const BATCH_SIZE = 100; // OpenAI supports up to 2048 inputs per batch
 
 /**
@@ -247,55 +247,56 @@ async function generateEmbeddingsForApp(appId, options = {}) {
 
   // Get all tables with metadata
   let tableFilter = force
-    ? 'WHERE at.app_id = $1'
-    : 'WHERE at.app_id = $1 AND at.embedding IS NULL';
+    ? 'WHERE at.app_id = ?'
+    : 'WHERE at.app_id = ? AND at.embedding IS NULL';
 
-  const tables = await query(
+  const [tables] = await query(
     `SELECT at.id, at.table_name, at.entity_name, at.description, at.entity_metadata
      FROM app_tables at ${tableFilter}
      ORDER BY at.id`,
     [appId]
   );
 
-  if (tables.rows.length === 0) {
+  if (tables.length === 0) {
     return { generated: 0, skipped: 0, errors: 0, message: 'All tables already have embeddings' };
   }
 
   // Get columns for all these tables
-  const tableIds = tables.rows.map(t => t.id);
-  const columns = await query(
+  const tableIds = tables.map(t => t.id);
+  const colPlaceholders = tableIds.map(() => '?').join(', ');
+  const [columns] = await query(
     `SELECT table_id, column_name, business_name, description, column_role
-     FROM app_columns WHERE table_id = ANY($1::int[])
+     FROM app_columns WHERE table_id IN (${colPlaceholders})
      ORDER BY table_id, column_name`,
-    [tableIds]
+    tableIds
   );
 
   // Group columns by table
   const colsByTable = {};
-  for (const col of columns.rows) {
+  for (const col of columns) {
     if (!colsByTable[col.table_id]) colsByTable[col.table_id] = [];
     colsByTable[col.table_id].push(col);
   }
 
   // Get synonyms for all tables in this app (builder-curated + AI-generated)
-  const synonyms = await query(
+  const [synonyms] = await query(
     `SELECT table_id, term FROM app_synonyms
-     WHERE app_id = $1 AND status = 'active'
+     WHERE app_id = ? AND status = 'active'
      ORDER BY table_id`,
     [appId]
   );
 
   // Group synonyms by table
   const synsByTable = {};
-  for (const syn of synonyms.rows) {
+  for (const syn of synonyms) {
     if (!synsByTable[syn.table_id]) synsByTable[syn.table_id] = [];
     synsByTable[syn.table_id].push(syn.term);
   }
 
-  console.log(`[Embeddings] Found ${synonyms.rows.length} active synonyms across ${Object.keys(synsByTable).length} tables for appId=${appId}`);
+  console.log(`[Embeddings] Found ${synonyms.length} active synonyms across ${Object.keys(synsByTable).length} tables for appId=${appId}`);
 
   // Build embedding texts
-  const tableTexts = tables.rows.map(t => ({
+  const tableTexts = tables.map(t => ({
     id: t.id,
     text: buildTableText(t, colsByTable[t.id] || [], synsByTable[t.id] || []),
   }));
@@ -316,7 +317,7 @@ async function generateEmbeddingsForApp(appId, options = {}) {
         const tableId = batch[emb.index].id;
         const vector = `[${emb.embedding.join(',')}]`;
         await query(
-          'UPDATE app_tables SET embedding = $1::vector WHERE id = $2',
+          'UPDATE app_tables SET embedding = ? WHERE id = ?',
           [vector, tableId]
         );
         generated++;
@@ -329,7 +330,7 @@ async function generateEmbeddingsForApp(appId, options = {}) {
     }
   }
 
-  const skipped = tables.rows.length - generated - errors;
+  const skipped = tables.length - generated - errors;
   console.log(`[Embeddings] appId=${appId}: ${generated} generated, ${skipped} skipped, ${errors} errors`);
 
   return { generated, skipped, errors };
@@ -354,18 +355,18 @@ async function semanticSchemaLink(appId, question, limit = 15, threshold = 0.25)
     const questionVector = `[${questionEmbedding.embedding.join(',')}]`;
 
     // Cosine similarity search against table embeddings
-    // 1 - (embedding <=> $1) converts cosine distance to similarity (1 = identical, 0 = orthogonal)
-    const result = await query(
+    // 1 - (embedding <=> ?) converts cosine distance to similarity (1 = identical, 0 = orthogonal)
+    const [rows] = await query(
       `SELECT id as table_id, table_name,
-              1 - (embedding <=> $1::vector) as similarity
+              1 - (embedding <=> ?) as similarity
        FROM app_tables
-       WHERE app_id = $2 AND embedding IS NOT NULL
-       ORDER BY embedding <=> $1::vector
-       LIMIT $3`,
+       WHERE app_id = ? AND embedding IS NOT NULL
+       ORDER BY embedding <=> ?
+       LIMIT ?`,
       [questionVector, appId, limit]
     );
 
-    return result.rows
+    return rows
       .filter(r => r.similarity >= threshold)
       .map(r => ({
         table_id: r.table_id,

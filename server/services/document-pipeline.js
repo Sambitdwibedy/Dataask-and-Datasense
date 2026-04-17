@@ -157,17 +157,17 @@ async function embedSingleText(text) {
  */
 async function processDocument(filePath, { appId, collectionId, userId, filename, fileType, workspaceId }) {
   // 1. Update source status
-  const srcResult = await query(
+  const [srcRows] = await query(
     `INSERT INTO doc_sources (collection_id, app_id, filename, file_type, file_size_bytes, status, uploaded_by)
-     VALUES ($1, $2, $3, $4, $5, 'processing', $6) RETURNING id`,
+     VALUES (?, ?, ?, ?, ?, 'processing', ?)`,
     [collectionId, appId, filename, fileType, fs.statSync(filePath).size, userId]
   );
-  const sourceId = srcResult.rows[0].id;
+  const sourceId = srcRows[0].id;
 
   // Helper to log progress into the DB (survives crashes)
   const logProgress = async (step) => {
     try {
-      await query(`UPDATE doc_sources SET error_message = $1 WHERE id = $2`, [
+      await query(`UPDATE doc_sources SET error_message = ? WHERE id = ?`, [
         `PROGRESS: ${step} at ${new Date().toISOString()}`, sourceId
       ]);
     } catch (e) { /* ignore log failures */ }
@@ -189,7 +189,7 @@ async function processDocument(filePath, { appId, collectionId, userId, filename
 
     await logProgress('step3-update-source');
     await query(
-      `UPDATE doc_sources SET extracted_text = $1, page_count = $2, metadata = $3 WHERE id = $4`,
+      `UPDATE doc_sources SET extracted_text = ?, page_count = ?, metadata = ? WHERE id = ?`,
       [text, pageCount, JSON.stringify(metadata), sourceId]
     );
     await logProgress('step3-update-source-done');
@@ -219,8 +219,8 @@ async function processDocument(filePath, { appId, collectionId, userId, filename
       const embeddingStr = `[${embedding.join(',')}]`;
       const t2 = Date.now();
       await query(
-        `INSERT INTO doc_chunks (source_id, collection_id, app_id, workspace_id, chunk_index, content, content_length, embedding, content_tsv, metadata)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, to_tsvector('english', $6), $9)`,
+        `INSERT INTO doc_chunks (source_id, collection_id, app_id, workspace_id, chunk_index, content, content_length, embedding, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           sourceId, collectionId, appId, workspaceId || null,
           chunks[i].index,
@@ -233,7 +233,7 @@ async function processDocument(filePath, { appId, collectionId, userId, filename
       console.log(`[DocPipeline] ${filename}: chunk ${i+1} — inserted in ${Date.now()-t2}ms (total: ${Date.now()-chunkStart}ms)`);
 
       // Update progress so it's observable from outside
-      await query(`UPDATE doc_sources SET chunk_count = $1 WHERE id = $2`, [i + 1, sourceId]);
+      await query(`UPDATE doc_sources SET chunk_count = ? WHERE id = ?`, [i + 1, sourceId]);
 
       // Help GC reclaim the vector memory and yield to event loop
       embedding.length = 0;
@@ -243,15 +243,15 @@ async function processDocument(filePath, { appId, collectionId, userId, filename
 
     // 6. Update source and collection
     await query(
-      `UPDATE doc_sources SET status = 'ready', chunk_count = $1 WHERE id = $2`,
+      `UPDATE doc_sources SET status = 'ready', chunk_count = ? WHERE id = ?`,
       [chunks.length, sourceId]
     );
     await query(
       `UPDATE doc_collections
-       SET doc_count = (SELECT COUNT(*) FROM doc_sources WHERE collection_id = $1 AND status = 'ready'),
-           chunk_count = (SELECT COUNT(*) FROM doc_chunks WHERE collection_id = $1),
+       SET doc_count = (SELECT COUNT(*) FROM doc_sources WHERE collection_id = ? AND status = 'ready'),
+           chunk_count = (SELECT COUNT(*) FROM doc_chunks WHERE collection_id = ?),
            updated_at = NOW()
-       WHERE id = $1`,
+       WHERE id = ?`,
       [collectionId]
     );
 
@@ -259,7 +259,7 @@ async function processDocument(filePath, { appId, collectionId, userId, filename
 
   } catch (err) {
     await query(
-      `UPDATE doc_sources SET status = 'error', error_message = $1 WHERE id = $2`,
+      `UPDATE doc_sources SET status = 'error', error_message = ? WHERE id = ?`,
       [err.message, sourceId]
     );
     throw err;

@@ -20,22 +20,22 @@ router.get('/:appId/patterns', async (req, res) => {
         usage_count,
         created_at
       FROM query_patterns
-      WHERE app_id = $1
+      WHERE app_id = ?
     `;
 
     const params = [appId];
 
     if (status) {
-      sql += ` AND status = $2`;
+      sql += ` AND status = ?`;
       params.push(status);
     }
 
     sql += ` ORDER BY usage_count DESC, created_at DESC`;
 
-    const result = await query(sql, params);
+    const [rows] = await query(sql, params);
 
     res.json({
-      patterns: result.rows,
+      patterns: rows,
     });
   } catch (err) {
     console.error('Get patterns error:', err);
@@ -48,17 +48,17 @@ router.get('/:appId/patterns/:patternId', async (req, res) => {
   try {
     const { appId, patternId } = req.params;
 
-    const result = await query(
-      `SELECT * FROM query_patterns WHERE id = $1 AND app_id = $2`,
+    const [rows] = await query(
+      `SELECT * FROM query_patterns WHERE id = ? AND app_id = ?`,
       [patternId, appId]
     );
 
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'Pattern not found' });
     }
 
     res.json({
-      pattern: result.rows[0],
+      pattern: rows[0],
     });
   } catch (err) {
     console.error('Get pattern detail error:', err);
@@ -71,20 +71,20 @@ router.post('/:appId/patterns/:patternId/approve', async (req, res) => {
   try {
     const { appId, patternId } = req.params;
 
-    const result = await query(
+    const [approveResult] = await query(
       `UPDATE query_patterns
        SET status = 'approved'
-       WHERE id = $1 AND app_id = $2
-       RETURNING *`,
+       WHERE id = ? AND app_id = ?`,
       [patternId, appId]
     );
 
-    if (result.rows.length === 0) {
+    if (approveResult.affectedRows === 0) {
       return res.status(404).json({ error: 'Pattern not found' });
     }
 
+    const [patternRows] = await query('SELECT * FROM query_patterns WHERE id = ?', [patternId]);
     res.json({
-      pattern: result.rows[0],
+      pattern: patternRows[0],
       message: 'Pattern approved',
     });
   } catch (err) {
@@ -98,19 +98,19 @@ router.get('/:appId/stats', async (req, res) => {
   try {
     const { appId } = req.params;
 
-    const result = await query(
+    const [rows] = await query(
       `SELECT
         COUNT(DISTINCT id) as total_patterns,
         COUNT(DISTINCT CASE WHEN status = 'approved' THEN id END) as approved_patterns,
         COUNT(DISTINCT CASE WHEN status = 'draft' THEN id END) as draft_patterns,
         SUM(usage_count) as total_usages
       FROM query_patterns
-      WHERE app_id = $1`,
+      WHERE app_id = ?`,
       [appId]
     );
 
     res.json({
-      stats: result.rows[0],
+      stats: rows[0],
     });
   } catch (err) {
     console.error('Get pattern stats error:', err);

@@ -25,7 +25,7 @@ router.get('/', async (req, res) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Authentication required' });
 
-    const result = await query(`
+    const [rows] = await query(`
       SELECT
         w.id, w.name, w.description, w.app_id, w.is_default, w.status, w.created_at,
         wm.role as member_role, wm.is_default as member_default,
@@ -38,7 +38,7 @@ router.get('/', async (req, res) => {
       FROM workspaces w
       JOIN workspace_members wm ON w.id = wm.workspace_id
       LEFT JOIN applications a ON w.app_id = a.id
-      WHERE wm.user_id = $1
+      WHERE wm.user_id = ?
         AND wm.enabled = TRUE
         AND (wm.start_date IS NULL OR wm.start_date <= CURRENT_DATE)
         AND (wm.end_date IS NULL OR wm.end_date >= CURRENT_DATE)
@@ -46,7 +46,7 @@ router.get('/', async (req, res) => {
       ORDER BY w.is_default DESC, wm.is_default DESC, w.name ASC
     `, [userId]);
 
-    res.json({ workspaces: result.rows });
+    res.json({ workspaces: rows });
   } catch (err) {
     console.error('List workspaces error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -60,47 +60,47 @@ router.get('/:id', async (req, res) => {
     const userId = req.user?.id;
 
     // Verify membership
-    const memberCheck = await query(
-      'SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND enabled = TRUE',
+    const [memberRows] = await query(
+      'SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND enabled = TRUE',
       [id, userId]
     );
-    if (memberCheck.rows.length === 0) {
+    if (memberRows.length === 0) {
       return res.status(403).json({ error: 'Not a member of this workspace' });
     }
 
-    const wsResult = await query(`
+    const [wsRows] = await query(`
       SELECT w.*, a.name as app_name, a.type as app_type, a.status as app_status
       FROM workspaces w
       LEFT JOIN applications a ON w.app_id = a.id
-      WHERE w.id = $1
+      WHERE w.id = ?
     `, [id]);
 
-    if (wsResult.rows.length === 0) {
+    if (wsRows.length === 0) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
 
     // Get collections in this workspace
-    const collectionsResult = await query(
+    const [collectionsRows] = await query(
       `SELECT id, name, description, doc_count, chunk_count, status
-       FROM doc_collections WHERE workspace_id = $1 ORDER BY name`,
+       FROM doc_collections WHERE workspace_id = ? ORDER BY name`,
       [id]
     );
 
     // Get members
-    const membersResult = await query(
+    const [membersRows] = await query(
       `SELECT wm.user_id, wm.role, wm.is_default, wm.enabled, u.name, u.email
        FROM workspace_members wm
        JOIN users u ON wm.user_id = u.id
-       WHERE wm.workspace_id = $1
+       WHERE wm.workspace_id = ?
        ORDER BY u.name`,
       [id]
     );
 
     res.json({
-      workspace: wsResult.rows[0],
-      collections: collectionsResult.rows,
-      members: membersResult.rows,
-      userRole: memberCheck.rows[0].role,
+      workspace: wsRows[0],
+      collections: collectionsRows,
+      members: membersRows,
+      userRole: memberRows[0].role,
     });
   } catch (err) {
     console.error('Get workspace error:', err);
@@ -116,22 +116,23 @@ router.post('/', async (req, res) => {
 
     if (!name) return res.status(400).json({ error: 'Workspace name required' });
 
-    const result = await query(
+    const [result] = await query(
       `INSERT INTO workspaces (name, description, app_id, created_by)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
+       VALUES (?, ?, ?, ?)`,
       [name, description || null, appId || null, userId]
     );
 
-    const workspace = result.rows[0];
+    const workspaceId = result.insertId;
 
     // Auto-add creator as admin member
     await query(
       `INSERT INTO workspace_members (workspace_id, user_id, role, is_default)
-       VALUES ($1, $2, 'admin', TRUE)`,
-      [workspace.id, userId]
+       VALUES (?, ?, 'admin', TRUE)`,
+      [workspaceId, userId]
     );
 
-    res.status(201).json({ workspace });
+    const [wsRows] = await query('SELECT * FROM workspaces WHERE id = ?', [workspaceId]);
+    res.status(201).json({ workspace: wsRows[0] });
   } catch (err) {
     console.error('Create workspace error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -146,23 +147,24 @@ router.put('/:id', async (req, res) => {
 
     const updates = [];
     const params = [];
-    let p = 1;
 
-    if (name !== undefined) { updates.push(`name = $${p++}`); params.push(name); }
-    if (description !== undefined) { updates.push(`description = $${p++}`); params.push(description); }
-    if (appId !== undefined) { updates.push(`app_id = $${p++}`); params.push(appId); }
-    if (status !== undefined) { updates.push(`status = $${p++}`); params.push(status); }
-    if (isDefault !== undefined) { updates.push(`is_default = $${p++}`); params.push(isDefault); }
+    if (name !== undefined) { updates.push(`name = ?`); params.push(name); }
+    if (description !== undefined) { updates.push(`description = ?`); params.push(description); }
+    if (appId !== undefined) { updates.push(`app_id = ?`); params.push(appId); }
+    if (status !== undefined) { updates.push(`status = ?`); params.push(status); }
+    if (isDefault !== undefined) { updates.push(`is_default = ?`); params.push(isDefault); }
     updates.push(`updated_at = NOW()`);
     params.push(id);
 
-    const result = await query(
-      `UPDATE workspaces SET ${updates.join(', ')} WHERE id = $${p} RETURNING *`,
+    const [result] = await query(
+      `UPDATE workspaces SET ${updates.join(', ')} WHERE id = ?`,
       params
     );
 
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Workspace not found' });
-    res.json({ workspace: result.rows[0] });
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Workspace not found' });
+
+    const [wsRows] = await query('SELECT * FROM workspaces WHERE id = ?', [id]);
+    res.json({ workspace: wsRows[0] });
   } catch (err) {
     console.error('Update workspace error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -173,9 +175,10 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await query('DELETE FROM workspaces WHERE id = $1 RETURNING *', [id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Workspace not found' });
-    res.json({ message: 'Workspace deleted', workspace: result.rows[0] });
+    const [wsRows] = await query('SELECT * FROM workspaces WHERE id = ?', [id]);
+    if (wsRows.length === 0) return res.status(404).json({ error: 'Workspace not found' });
+    await query('DELETE FROM workspaces WHERE id = ?', [id]);
+    res.json({ message: 'Workspace deleted', workspace: wsRows[0] });
   } catch (err) {
     console.error('Delete workspace error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -190,17 +193,20 @@ router.post('/:id/members', async (req, res) => {
 
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
-    const result = await query(
+    await query(
       `INSERT INTO workspace_members (workspace_id, user_id, role, is_default, start_date, end_date)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (workspace_id, user_id) DO UPDATE SET
-         role = EXCLUDED.role, is_default = EXCLUDED.is_default,
-         start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date, enabled = TRUE
-       RETURNING *`,
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         role = VALUES(role), is_default = VALUES(is_default),
+         start_date = VALUES(start_date), end_date = VALUES(end_date), enabled = TRUE`,
       [id, userId, role || 'reader', isDefault || false, startDate || null, endDate || null]
     );
 
-    res.status(201).json({ member: result.rows[0] });
+    const [memberRows] = await query(
+      'SELECT * FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      [id, userId]
+    );
+    res.status(201).json({ member: memberRows[0] });
   } catch (err) {
     console.error('Add member error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -211,7 +217,7 @@ router.post('/:id/members', async (req, res) => {
 router.delete('/:id/members/:userId', async (req, res) => {
   try {
     const { id, userId } = req.params;
-    await query('DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [id, userId]);
+    await query('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?', [id, userId]);
     res.json({ message: 'Member removed' });
   } catch (err) {
     console.error('Remove member error:', err);
@@ -223,49 +229,52 @@ router.delete('/:id/members/:userId', async (req, res) => {
 // This creates a workspace for each existing application and assigns all users
 router.post('/auto-create', async (req, res) => {
   try {
-    const apps = await query('SELECT id, name, type, description FROM applications');
-    const users = await query('SELECT id FROM users');
+    const [apps] = await query('SELECT id, name, type, description FROM applications');
+    const [users] = await query('SELECT id FROM users');
     const created = [];
 
-    for (const app of apps.rows) {
+    for (const app of apps) {
       // Check if workspace already exists for this app
-      const existing = await query('SELECT id FROM workspaces WHERE app_id = $1', [app.id]);
-      if (existing.rows.length > 0) {
-        created.push({ appId: app.id, workspaceId: existing.rows[0].id, status: 'already_exists' });
+      const [existing] = await query('SELECT id FROM workspaces WHERE app_id = ?', [app.id]);
+      if (existing.length > 0) {
+        created.push({ appId: app.id, workspaceId: existing[0].id, status: 'already_exists' });
         continue;
       }
 
       // Create workspace (first one is default)
       const isFirst = created.length === 0;
-      const ws = await query(
+      const [wsResult] = await query(
         `INSERT INTO workspaces (name, description, app_id, is_default)
-         VALUES ($1, $2, $3, $4) RETURNING *`,
+         VALUES (?, ?, ?, ?)`,
         [app.name, app.description || `Workspace for ${app.name} (${app.type})`, app.id, isFirst]
       );
+      const wsId = wsResult.insertId;
 
       // Assign all users to this workspace
-      for (const user of users.rows) {
-        await query(
-          `INSERT INTO workspace_members (workspace_id, user_id, role, is_default)
-           VALUES ($1, $2, 'reader', TRUE)
-           ON CONFLICT (workspace_id, user_id) DO NOTHING`,
-          [ws.rows[0].id, user.id]
-        );
+      for (const user of users) {
+        try {
+          await query(
+            `INSERT INTO workspace_members (workspace_id, user_id, role, is_default)
+             VALUES (?, ?, 'reader', TRUE)
+             ON DUPLICATE KEY UPDATE enabled = TRUE`,
+            [wsId, user.id]
+          );
+        } catch (e) { /* skip duplicates */ }
       }
 
       // Link existing doc_collections for this app to the workspace
       await query(
-        'UPDATE doc_collections SET workspace_id = $1 WHERE app_id = $2 AND workspace_id IS NULL',
-        [ws.rows[0].id, app.id]
+        'UPDATE doc_collections SET workspace_id = ? WHERE app_id = ? AND workspace_id IS NULL',
+        [wsId, app.id]
       );
 
       // Link existing doc_chunks for this app to the workspace
       await query(
-        'UPDATE doc_chunks SET workspace_id = $1 WHERE app_id = $2 AND workspace_id IS NULL',
-        [ws.rows[0].id, app.id]
+        'UPDATE doc_chunks SET workspace_id = ? WHERE app_id = ? AND workspace_id IS NULL',
+        [wsId, app.id]
       );
 
-      created.push({ appId: app.id, workspaceId: ws.rows[0].id, name: app.name, status: 'created' });
+      created.push({ appId: app.id, workspaceId: wsId, name: app.name, status: 'created' });
     }
 
     res.json({ message: `Processed ${created.length} applications`, workspaces: created });

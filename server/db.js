@@ -1,25 +1,16 @@
-// Database connection — shared with BOKG Builder (same DATABASE_URL)
-const { Pool } = require('pg');
+// Database connection — mysql2 pool (PostgreSQL → MySQL migration)
+const mysql = require('mysql2/promise');
 require('dotenv').config();
 
-// Determine SSL config based on the DATABASE_URL host.
-// Vercel Postgres, Neon, Supabase, Railway all require SSL but each has
-// slightly different TLS requirements. Setting rejectUnauthorized: false is
-// safe for managed cloud Postgres providers (certs are managed by the provider).
-function sslConfig(url) {
-  if (!url) return false;
-  // Local/Docker connections — no SSL needed
-  if (url.includes('localhost') || url.includes('127.0.0.1')) return false;
-  // All remote managed providers (Railway, Neon, Supabase, Vercel Postgres, etc.)
-  return { rejectUnauthorized: false };
-}
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 10,
-  ssl: sslConfig(process.env.DATABASE_URL),
+const pool = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  timezone: 'Z',
 });
 
-const query = (text, params) => pool.query(text, params);
+// Compatibility wrapper: returns [rows, fields] like mysql2 native
+const query = (sql, params) => pool.execute(sql, params || []);
 
 module.exports = { pool, query };

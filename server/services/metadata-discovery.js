@@ -95,11 +95,11 @@ async function discoverMetadataTables(appId) {
   console.log(`[MetadataDiscovery] Starting discovery for app ${appId}...`);
 
   // Get all tables in the application
-  const tablesResult = await query(
-    `SELECT id, table_name, row_count FROM app_tables WHERE app_id = $1 ORDER BY table_name`,
+  const [tablesRows] = await query(
+    `SELECT id, table_name, row_count FROM app_tables WHERE app_id = ? ORDER BY table_name`,
     [appId]
   );
-  const tables = tablesResult.rows;
+  const tables = tablesRows;
   const tableNames = tables.map(t => t.table_name.toLowerCase());
 
   console.log(`[MetadataDiscovery] Scanning ${tables.length} tables...`);
@@ -184,11 +184,11 @@ async function scoreMetadataCandidate(appId, table, allTableNames) {
   }
 
   // 2. Structure-based scoring — check column names
-  const colsResult = await query(
-    `SELECT column_name, data_type FROM app_columns WHERE table_id = $1`,
+  const [colsRows] = await query(
+    `SELECT column_name, data_type FROM app_columns WHERE table_id = ?`,
     [table.id]
   );
-  const columns = colsResult.rows;
+  const columns = colsRows;
 
   let hasTableRef = false;
   let hasColumnRef = false;
@@ -297,7 +297,7 @@ async function confirmMetadataContent(appId, tableName, tableRefColumn, allTable
        FROM "${tableName}"
        WHERE LOWER("${tableRefColumn}") IN (${tableList})`
     );
-    const matchCount = parseInt(matchResult.rows[0]?.match_count || 0);
+    const matchCount = parseInt(matchRows[0]?.match_count || 0);
 
     // If at least 10% of our schema tables appear in this metadata table, it's confirmed
     return matchCount >= Math.max(3, Math.floor(allTableNames.length * 0.1));
@@ -337,16 +337,16 @@ async function confirmViaForeignKeyResolution(appId, tableName, tableRefCols, al
     for (const pattern of companionPatterns) {
       try {
         // Find tables that have both the ID column and a name column
-        const companionResult = await query(
+        const [companionRows] = await query(
           `SELECT DISTINCT t.table_name
            FROM app_tables t
-           JOIN app_columns c1 ON c1.table_id = t.id AND UPPER(c1.column_name) = UPPER($2)
-           JOIN app_columns c2 ON c2.table_id = t.id AND UPPER(c2.column_name) = UPPER($3)
-           WHERE t.app_id = $1 AND UPPER(t.table_name) != UPPER($4)`,
+           JOIN app_columns c1 ON c1.table_id = t.id AND UPPER(c1.column_name) = UPPER(?)
+           JOIN app_columns c2 ON c2.table_id = t.id AND UPPER(c2.column_name) = UPPER(?)
+           WHERE t.app_id = ? AND UPPER(t.table_name) != UPPER(?)`,
           [appId, idCol, pattern.nameCol, tableName]
         );
 
-        for (const companion of companionResult.rows) {
+        for (const companion of companionRows) {
           // Check how many of OUR tables appear via the FK resolution JOIN.
           // Instead of sampling (which fails with large metadata tables),
           // count how many of our schema tables exist in the resolved names.
@@ -358,7 +358,7 @@ async function confirmViaForeignKeyResolution(appId, tableName, tableRefCols, al
             WHERE LOWER(c."${pattern.nameCol}") IN (${tableList})
           `;
           const joinResult = await executeOnSourceData(appId, joinSql);
-          const matches = parseInt(joinResult.rows[0]?.match_count || 0);
+          const matches = parseInt(joinRows[0]?.match_count || 0);
 
           if (matches >= Math.max(3, Math.floor(allTableNames.length * 0.1))) {
             return {
@@ -425,10 +425,10 @@ async function extractMetadataFromTable(appId, candidate, allTableNames) {
       const result = await executeOnSourceData(appId,
         `SELECT * FROM "${table_name}" LIMIT 200`
       );
-      if (result.rows.length > 0) {
-        lines.push(`Table: ${table_name} (${result.rows.length} rows sampled)`);
+      if (rows.length > 0) {
+        lines.push(`Table: ${table_name} (${rows.length} rows sampled)`);
         lines.push(`Columns: ${result.columns.join(', ')}`);
-        for (const row of result.rows.slice(0, 100)) {
+        for (const row of rows.slice(0, 100)) {
           const vals = Object.entries(row)
             .filter(([k, v]) => v !== null && v !== '')
             .map(([k, v]) => `${k}=${v}`)
@@ -451,7 +451,7 @@ async function extractMetadataFromTable(appId, candidate, allTableNames) {
       const sql = `SELECT ${selectCols.join(', ')} FROM "${table_name}" t ${joinClause} ${whereClause} LIMIT 2000`;
       const result = await executeOnSourceData(appId, sql);
 
-      if (result.rows.length > 0) {
+      if (rows.length > 0) {
         const displayCols = useFkResolution
           ? ['resolved_table_name', ...(columnRefCol ? [columnRefCol] : []), ...descCols, ...typeCols]
           : selectCols.map(s => s.replace(/^t\./, '').replace(/"/g, ''));
@@ -459,7 +459,7 @@ async function extractMetadataFromTable(appId, candidate, allTableNames) {
         lines.push(`Fields: ${displayCols.join(', ')}`);
         lines.push('---');
 
-        for (const row of result.rows) {
+        for (const row of rows) {
           const parts = [];
           // Resolve the target table name — either directly or via FK JOIN
           const targetTable = useFkResolution
@@ -513,8 +513,8 @@ async function discoverAndStoreMetadata(appId) {
 
   if (discovery.extracted_context && discovery.extracted_entries > 0) {
     // Check if we already have an auto-discovered document for this app
-    const existing = await query(
-      `SELECT id FROM context_documents WHERE app_id = $1 AND filename = 'Auto-Discovered Schema Metadata'`,
+    const [existingRows] = await query(
+      `SELECT id FROM context_documents WHERE app_id = ? AND filename = 'Auto-Discovered Schema Metadata'`,
       [appId]
     );
 
@@ -522,18 +522,18 @@ async function discoverAndStoreMetadata(appId) {
     // This enables table-scoped context injection at enrichment time
     const indexJson = JSON.stringify(discovery.table_index || {});
 
-    if (existing.rows.length > 0) {
+    if (existingRows.length > 0) {
       // Update existing
       await query(
         `UPDATE context_documents
-         SET extracted_text = $1, description = $2, file_size = $3, metadata = $4, uploaded_at = NOW()
-         WHERE id = $5`,
+         SET extracted_text = ?, description = ?, file_size = ?, metadata = ?, uploaded_at = NOW()
+         WHERE id = ?`,
         [
           discovery.extracted_context,
           `Auto-discovered from ${discovery.confirmed_count} metadata tables (${discovery.extracted_entries} entries, ${Object.keys(discovery.table_index || {}).length} tables indexed)`,
           discovery.extracted_context.length,
           indexJson,
-          existing.rows[0].id,
+          existingRows[0].id,
         ]
       );
       console.log(`[MetadataDiscovery] Updated existing auto-discovered context document`);
@@ -541,7 +541,7 @@ async function discoverAndStoreMetadata(appId) {
       // Create new
       await query(
         `INSERT INTO context_documents (app_id, filename, file_type, file_size, extracted_text, description, metadata, uploaded_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
         [
           appId,
           'Auto-Discovered Schema Metadata',
