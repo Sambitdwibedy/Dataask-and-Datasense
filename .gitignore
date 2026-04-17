@@ -1,0 +1,12 @@
+node_modules/
+.env
+uploads/
+*.log
+.DS_Store
+
+# SQLite data files — too large for GitHub (use local seeding scripts instead)
+data/
+
+# SQLite WAL files
+*.sqlite-wal
+*.sqlite-shm

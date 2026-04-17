@@ -1,0 +1,53 @@
+/**
+ * Applications Routes — List available applications for Data Ask
+ *
+ * Reads from the shared applications table (managed by BOKG Builder).
+ * Data Ask only shows apps that have published knowledge graphs or document collections.
+ */
+const express = require('express');
+const { query } = require('../db');
+
+const router = express.Router();
+
+// GET /api/apps — List applications available for querying
+router.get('/', async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT a.id, a.name, a.type, a.description, a.status, a.published_at,
+              (SELECT COUNT(*) FROM app_tables WHERE app_id = a.id AND enrichment_status IN ('approved', 'ai_enriched')) as table_count,
+              (SELECT COUNT(*) FROM doc_sources WHERE app_id = a.id AND status = 'ready') as doc_count,
+              (SELECT COUNT(*) FROM doc_collections WHERE app_id = a.id) as collection_count
+       FROM applications a
+       ORDER BY a.name`
+    );
+    res.json({ applications: result.rows });
+  } catch (err) {
+    console.error('List apps error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/apps/:id — Single application details
+router.get('/:id', async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT a.*,
+              (SELECT COUNT(*) FROM app_tables WHERE app_id = a.id AND enrichment_status IN ('approved', 'ai_enriched')) as table_count,
+              (SELECT COUNT(*) FROM doc_sources WHERE app_id = a.id AND status = 'ready') as doc_count,
+              (SELECT COUNT(*) FROM doc_collections WHERE app_id = a.id) as collection_count,
+              (SELECT COUNT(*) FROM doc_chunks WHERE app_id = a.id) as chunk_count
+       FROM applications a WHERE a.id = $1`,
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    res.json({ application: result.rows[0] });
+  } catch (err) {
+    console.error('Get app error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;

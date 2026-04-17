@@ -1,0 +1,30 @@
+# Large SQLite data files — used only for local seeding, not needed at runtime
+data/
+
+# Root-level client/ is superseded by server/client/ (moved for Vercel compatibility)
+client/
+
+# Sample context files
+sample-context/
+
+# Documentation
+docs/
+
+# Docker / Railway deployment files (not needed for Vercel)
+Dockerfile
+railway.toml
+
+# Dev/test files
+CONVERSATION_ROUTER_TEST_PLAN.md
+server/seed-*.js
+server/reclassify-domains.js
+
+# Backup files
+server/routes/apps.js.bak
+
+# Standard ignores
+node_modules/
+.env
+uploads/
+*.log
+.DS_Store

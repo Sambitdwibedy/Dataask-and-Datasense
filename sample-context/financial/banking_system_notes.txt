@@ -1,0 +1,43 @@
+From: Petr Horak <p.horak@czbank-internal.cz>
+To: Jana Krejci <j.krejci@czbank-internal.cz>
+Date: 2017-06-14
+Subject: RE: RE: handover notes for the reporting database
+
+Jana,
+
+Sorry for the delay. Here's what I can remember about the reporting DB
+before I move to the Prague office next month. Martin S. set most of
+this up in the late 90s and I don't think he documented much.
+
+The LOAN table status column is the one that always trips people up.
+It's a single letter A/B/C/D but it's NOT a priority ranking. It's
+a 2x2 grid:
+  A = Finished, client paid OK
+  B = Finished, client defaulted
+  C = Running, payments current
+  D = Running, client in arrears
+So for risk reports you want B and D. For active portfolio it's C and D.
+
+Dates are stored as integers in YYMMDD format (e.g. 980101 = Jan 1 1998).
+I know it's ugly but that's how the original Czech system worked.
+Don't try to treat them as timestamps.
+
+The DISTRICT table is the one I know least about. The columns are
+labeled A2 through A16 because they came from a Czech Statistical
+Office data feed and nobody renamed them. I think A2 is the district
+name and A4 might be population? A11 is definitely the average salary
+and it's in CZK not USD — I remember that causing a bug in 2015.
+I'm honestly not sure about the rest. There might be an old report
+in the analytics shared drive that uses aliases for them.
+
+One more thing — there's a column A9 on district that looks like it
+should have data but it's garbage. I think it was supposed to be a
+literacy metric but the CSO feed never sent it properly. Don't use it.
+
+I don't have time to write up the transaction codes right now but
+the key thing is they're in Czech. PRIJEM means income/credit and
+VYDAJ means expense/debit. The other operation codes I'd have to
+look up — ask Martin if you can reach him.
+
+Good luck,
+Petr

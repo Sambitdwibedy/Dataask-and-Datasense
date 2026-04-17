@@ -1,0 +1,38 @@
+{
+  "name": "ida-data-ask",
+  "version": "0.3.0",
+  "description": "IDA — Intelligent Data Assistant (consolidated BOKG Builder + Data Ask)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "init-db": "node init-db.js",
+    "seed-ofbiz": "node seed-ofbiz.js",
+    "seed-bird": "node seed-bird.js",
+    "setup": "node init-db.js && node seed-ofbiz.js && node seed-bird.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "pg": "^8.10.0",
+    "pgvector": "^0.2.0",
+    "jsonwebtoken": "^9.0.0",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.0.3",
+    "compression": "^1.7.4",
+    "helmet": "^7.0.0",
+    "form-data": "^4.0.0",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.6.0",
+    "xlsx": "^0.18.5",
+    "openai": "^4.20.0",
+    "@anthropic-ai/sdk": "^0.39.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

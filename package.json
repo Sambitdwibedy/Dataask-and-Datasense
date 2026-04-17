@@ -1,0 +1,12 @@
+{
+  "name": "ida-data-ask",
+  "version": "0.3.0",
+  "description": "IDA — Intelligent Data Assistant (Vercel root manifest)",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "cd server && nodemon index.js"
+  }
+}

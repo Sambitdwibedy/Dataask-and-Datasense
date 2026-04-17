@@ -1,0 +1,14 @@
+Table,Column,Business Name,Description,Notes
+account,account_id,Account ID,Primary key for account table,
+account,district_id,District ID,FK to district table - branch location,
+account,date,Account Opening Date,Date the account was opened,Stored as YYMMDD integer
+account,frequency,Statement Frequency,How often statements are issued,"Values in Czech - MESICNE=monthly, TYDNE=weekly, PO OBRATU=per transaction"
+card,card_id,Card ID,Primary key for credit card,
+card,type,Card Tier,Credit card product level,"junior=Basic, classic=Standard, gold=Premium"
+card,issued,Card Issue Date,When the card was issued,Some dates appear invalid (future dates)
+disp,disp_id,Disposition ID,Primary key,
+disp,type,Disposition Type,Account holder relationship,"OWNER=Primary account holder, DISPONENT=Authorized secondary user"
+loan,loan_id,Loan ID,Primary key for loan,
+loan,amount,Loan Amount,Total loan principal,In USD
+loan,payments,Monthly Installment,Scheduled monthly payment,In USD
+loan,duration,Loan Duration,Length of loan in months,
