@@ -5,32 +5,14 @@
       "src": "server/index.js",
       "use": "@vercel/node",
       "config": {
-        "maxLambdaSize": "50mb",
-        "includeFiles": [
-          "server/**",
-          "!server/seed-*.js",
-          "!server/reclassify-domains.js"
-        ]
+        "maxLambdaSize": "50mb"
       }
     }
   ],
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "server/index.js"
-    },
-    {
       "src": "/(.*)",
       "dest": "server/index.js"
     }
-  ],
-  "env": {
-    "NODE_ENV": "production"
-  },
-  "functions": {
-    "server/index.js": {
-      "maxDuration": 60,
-      "memory": 1024
-    }
-  }
+  ]
 }
